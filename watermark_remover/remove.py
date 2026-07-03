@@ -65,6 +65,11 @@ def remove_unblend(image_rgb: np.ndarray, model: WatermarkModel,
 
     a = model.alpha[..., None]
     recover = (model.alpha < OPAQUE_ALPHA)[..., None]
+    # A gray watermark can only brighten pixels darker than itself:
+    # I = aW + (1-a)B >= aW.  Observing I well below aW means the watermark
+    # is absent/faded there (some exports crush it on near-black areas) —
+    # touching those pixels would stamp black stains, so leave them alone.
+    recover = recover & (crop >= model.alpha_w - 10.0).all(axis=2, keepdims=True)
     denom = np.maximum(1.0 - a, 0.02)
     unblended = (crop - model.alpha_w) / denom
     crop_new = np.where(recover, unblended, crop)
