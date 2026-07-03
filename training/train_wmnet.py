@@ -33,18 +33,19 @@ PATCH = 192
 
 
 class PairMaker:
-    def __init__(self, model: estimate.WatermarkModel, bg_dir: str, seed: int = 0):
+    def __init__(self, models, bg_dir: str, seed: int = 0):
+        if not isinstance(models, (list, tuple)):
+            models = [models]
         self.rng = np.random.default_rng(seed)
-        self.alpha = model.alpha
-        # per-pixel watermark color; fall back to the median color where
-        # alpha is too small to divide safely
-        a = np.maximum(model.alpha, 0.08)[..., None]
-        Wf = model.alpha_w / a
-        strong = model.alpha > 0.25
-        med = np.median(model.alpha_w[strong] / a[strong[..., None]].reshape(-1, 1),
-                        axis=0) if strong.any() else np.array([170, 170, 170])
-        Wf[~strong] = med
-        self.Wf = np.clip(Wf, 0, 255).astype(np.float32)
+        self.variants = []
+        for model in models:
+            a = np.maximum(model.alpha, 0.08)[..., None]
+            Wf = model.alpha_w / a
+            strong = model.alpha > 0.25
+            med = np.median(model.alpha_w[strong] / a[strong[..., None]].reshape(-1, 1),
+                            axis=0) if strong.any() else np.array([170, 170, 170])
+            Wf[~strong] = med
+            self.variants.append((model.alpha, np.clip(Wf, 0, 255).astype(np.float32)))
         self.bgs = []
         for p in sorted(glob.glob(os.path.join(bg_dir, "*"))):
             img = cv2.imread(p, cv2.IMREAD_COLOR)
@@ -86,13 +87,14 @@ class PairMaker:
         B += r.normal(0, r.uniform(0.5, 2.0), B.shape).astype(np.float32)
         B = np.clip(B, 0, 255)
 
-        # random window of the watermark at random scale/opacity
+        # random variant + window of the watermark at random scale/opacity
+        v_alpha, v_W = self.variants[int(r.integers(len(self.variants)))]
         scale = r.uniform(0.55, 1.15)
         op = r.uniform(0.75, 1.25)
-        ah, aw_ = self.alpha.shape
+        ah, aw_ = v_alpha.shape
         th, tw = int(ah * scale), int(aw_ * scale)
-        a_s = cv2.resize(self.alpha, (tw, th), interpolation=cv2.INTER_AREA)
-        W_s = cv2.resize(self.Wf, (tw, th), interpolation=cv2.INTER_AREA)
+        a_s = cv2.resize(v_alpha, (tw, th), interpolation=cv2.INTER_AREA)
+        W_s = cv2.resize(v_W, (tw, th), interpolation=cv2.INTER_AREA)
         # pick a window that actually contains ink most of the time
         for _ in range(8):
             wy = int(r.integers(0, max(th - PATCH, 1)))
@@ -148,9 +150,9 @@ def main():
     args = ap.parse_args()
 
     torch.manual_seed(0)
-    model = estimate.WatermarkModel.load(args.model)
-    maker = PairMaker(model, args.backgrounds)
-    val_x, val_y, val_m = PairMaker(model, args.backgrounds, seed=999).batch(12)
+    models = [estimate.WatermarkModel.load(p) for p in args.model.split(",")]
+    maker = PairMaker(models, args.backgrounds)
+    val_x, val_y, val_m = PairMaker(models, args.backgrounds, seed=999).batch(12)
 
     net = WMNet()
     print(f"params: {sum(p.numel() for p in net.parameters())/1e3:.0f}k")

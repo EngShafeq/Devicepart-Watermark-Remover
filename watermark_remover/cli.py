@@ -64,7 +64,8 @@ def cmd_remove(args: argparse.Namespace) -> None:
     batch = _load_batch(args.input_dir, args.keyword)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    model = estimate.WatermarkModel.load(args.model) if args.model else None
+    models = [estimate.WatermarkModel.load(p) for p in args.model.split(",")] \
+        if args.model else []
     template = io_utils.load_image(args.template).rgb if args.template else None
     if template is not None:
         from PIL import Image
@@ -75,12 +76,16 @@ def cmd_remove(args: argparse.Namespace) -> None:
     if args.bbox:
         fixed_bbox = tuple(int(v) for v in args.bbox.split(","))
 
-    def _model_fits(m, shape):
-        if m is None:
-            return False
-        if shape == m.image_shape:
-            return True
-        return abs(shape[1] / shape[0] - m.image_shape[1] / m.image_shape[0]) < 0.01
+    def _pick_model(shape):
+        """Native-size match wins; otherwise the first model with the same
+        aspect ratio (its matte is rescaled + registered per image)."""
+        for m in models:
+            if shape == m.image_shape:
+                return m
+        for m in models:
+            if abs(shape[1] / shape[0] - m.image_shape[1] / m.image_shape[0]) < 0.01:
+                return m
+        return None
 
     net = None
     if args.net:
@@ -91,17 +96,22 @@ def cmd_remove(args: argparse.Namespace) -> None:
     for item in batch:
         name = os.path.basename(item.path)
         try:
-            if net is not None and _model_fits(model, item.rgb.shape[:2]):
+            model = _pick_model(item.rgb.shape[:2])
+            # Cleanup inpaints leftovers; on text-dense products (labels,
+            # chip prints) it can eat real print, so it only runs for the
+            # primary (first-listed) variant.
+            do_cleanup = (not args.no_cleanup) and models and model is models[0]
+            if net is not None and model is not None:
                 from . import estimate as est
                 from . import neural
                 reg = est.register_model(item.rgb, model)
                 out = neural.remove_neural(item.rgb, reg, net)
-                if not args.no_cleanup:
+                if do_cleanup:
                     out = remove.cleanup_residual(out, reg)
                 how = "neural"
-            elif _model_fits(model, item.rgb.shape[:2]):
+            elif model is not None:
                 out = remove.remove_unblend(item.rgb, model)
-                if not args.no_cleanup:
+                if do_cleanup:
                     out = remove.cleanup_residual(out, model)
                 how = "unblend"
             else:
@@ -172,7 +182,9 @@ def main(argv: list[str] | None = None) -> None:
 
     r = sub.add_parser("remove", parents=[common], help="remove the watermark")
     r.add_argument("--output-dir", required=True)
-    r.add_argument("--model", default=None, help=".npz model from `fit` (best quality)")
+    r.add_argument("--model", default=None,
+                   help="comma-separated .npz models from `fit`; the best-fitting one "
+                        "is chosen per image (native size first)")
     r.add_argument("--template", default=None, help="watermark logo image (PNG w/ alpha)")
     r.add_argument("--bbox", default=None, help="fixed x,y,w,h region to inpaint")
     r.add_argument("--jpeg-quality", type=int, default=97)

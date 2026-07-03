@@ -118,10 +118,19 @@ python training/train_wmnet.py --model models/deviceparts_1500.npz \
     --backgrounds clean_photos/ --out models/wmnet.pt --steps 3000
 ```
 
-### Known limitation — the tilted watermark variant
+### The tilted watermark variant (1000×1000 exports)
 
-Some exports (e.g. certain 1000×1000 photos) carry a *tilted* variant of
-the logo at varying positions. Two sample images are not enough to learn
-it. Collect **6+ photos with that variant** (any size, same variant) and
-run `fit` on them to produce a second model; the tool auto-registers
-placement per image for non-native sizes.
+A second model, fitted on 7 sample photos, handles the *tilted* variant:
+`models/deviceparts_1000_tilted.npz`. Pass both models and the tool picks
+the right one per image (native size first) and fine-registers placement:
+
+```bash
+python -m watermark_remover remove --input-dir originals/ --output-dir clean/ \
+    --model models/deviceparts_1500.npz,models/deviceparts_1000_tilted.npz \
+    --net models/wmnet.pt
+```
+
+The neural refiner is trained on both variants. Cleanup only runs for the
+primary (first-listed) model — on text-dense products (battery labels,
+chip prints) it could otherwise eat real print. To sharpen the tilted
+model further, re-run `fit` on a larger folder of that variant.

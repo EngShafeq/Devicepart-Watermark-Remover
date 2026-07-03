@@ -92,7 +92,8 @@ def remove_unblend(image_rgb: np.ndarray, model: WatermarkModel,
 
 
 def cleanup_residual(image_rgb: np.ndarray, model: WatermarkModel,
-                     thresh: float | None = None) -> np.ndarray:
+                     thresh: float | None = None,
+                     flat_blend: bool = True) -> np.ndarray:
     """Safety net after unblending: any pixel inside the watermark footprint
     that still deviates from its local background is a leftover (alpha was
     over- or under-estimated there) — inpaint just those pixels from their
@@ -141,7 +142,7 @@ def cleanup_residual(image_rgb: np.ndarray, model: WatermarkModel,
         full[y:y + h, x:x + w] = bad
         out = remove_inpaint(image_rgb, full)
 
-    if ring is not None:
+    if ring is not None and flat_blend:
         # On genuinely flat surroundings (plain screens, seamless paper)
         # inpainting the whole footprint reproduces the background exactly,
         # erasing any faint leftover the unblend missed.  On textured areas

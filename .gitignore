@@ -6,3 +6,7 @@ samples/*.png
 .pytest_cache/
 samples/*.npz
 verify_out/
+samples_v2/
+all_samples/
+train_bgs/
+final_all/
