@@ -94,3 +94,34 @@ python -m pytest tests/ -q
 - Use this tool only on images you own or are licensed to use.
 - For a new watermark (different site export), just re-run `fit` on a
   folder of the new photos.
+
+## Neural refiner (new)
+
+A compact U-Net (`models/wmnet.pt`, 263k params) trained **specifically on
+this watermark** refines the analytic result: it was trained on pairs made
+by stamping the learned watermark onto real device-part textures at many
+scales/opacities with JPEG round-trips, then simulating the analytic
+unblend — so it learns to repair exactly the residues the physics step
+leaves (stroke edges, JPEG blocking, slight misalignment) without the
+blur that inpainting causes. Its correction is clipped to the physical
+bound α·255 so it can never invent content.
+
+```bash
+python -m watermark_remover remove --input-dir originals/ --output-dir clean/ \
+    --model models/deviceparts_1500.npz --net models/wmnet.pt
+```
+
+Retrain in ~15 min on any CPU after re-fitting the watermark:
+
+```bash
+python training/train_wmnet.py --model models/deviceparts_1500.npz \
+    --backgrounds clean_photos/ --out models/wmnet.pt --steps 3000
+```
+
+### Known limitation — the tilted watermark variant
+
+Some exports (e.g. certain 1000×1000 photos) carry a *tilted* variant of
+the logo at varying positions. Two sample images are not enough to learn
+it. Collect **6+ photos with that variant** (any size, same variant) and
+run `fit` on them to produce a second model; the tool auto-registers
+placement per image for non-native sizes.

@@ -82,11 +82,20 @@ def cmd_remove(args: argparse.Namespace) -> None:
             return True
         return abs(shape[1] / shape[0] - m.image_shape[1] / m.image_shape[0]) < 0.01
 
+    net = None
+    if args.net:
+        from . import neural
+        net = neural.load_net(args.net)
+
     report = []
     for item in batch:
         name = os.path.basename(item.path)
         try:
-            if _model_fits(model, item.rgb.shape[:2]):
+            if net is not None and _model_fits(model, item.rgb.shape[:2]):
+                from . import neural
+                out = neural.remove_neural(item.rgb, model, net)
+                how = "neural"
+            elif _model_fits(model, item.rgb.shape[:2]):
                 out = remove.remove_unblend(item.rgb, model)
                 if not args.no_cleanup:
                     out = remove.cleanup_residual(out, model)
@@ -165,6 +174,9 @@ def main(argv: list[str] | None = None) -> None:
     r.add_argument("--jpeg-quality", type=int, default=97)
     r.add_argument("--no-cleanup", action="store_true",
                    help="skip the residual cleanup pass after unblending")
+    r.add_argument("--net", default=None,
+                   help="trained WMNet weights (.pt) — uses the neural remover "
+                        "instead of the analytic unblend (requires torch)")
     r.set_defaults(func=cmd_remove)
 
     d = sub.add_parser("detect", parents=[common],

@@ -183,6 +183,64 @@ def estimate_watermark(
                           alpha_w=alpha_w.astype(np.float32), image_shape=shape)
 
 
+def register_model(image_rgb: np.ndarray, model: "WatermarkModel",
+                   scales=(0.85, 0.92, 1.0, 1.08, 1.15),
+                   search_pad: int = 60) -> "WatermarkModel":
+    """Fine-align the watermark matte to one specific image.
+
+    Different export sizes of the site stamp the watermark with small
+    position/scale differences; correlating the matte against the image's
+    local-background deviation ("ink") finds the exact placement before
+    unblending.  Returns a shifted/rescaled copy of the model (or the
+    original if no placement scores clearly)."""
+    if image_rgb.shape[:2] == model.image_shape:
+        # native size: the batch fit already nailed the placement; searching
+        # again can only false-lock on product structure.
+        return model
+    work = model.rescaled(image_rgb.shape[:2])
+    x, y, w, h = work.bbox
+    H, W = image_rgb.shape[:2]
+    gray = image_rgb.astype(np.float32).mean(axis=2)
+    g_u8 = np.clip(gray, 0, 255).astype(np.uint8)
+    ink = np.zeros_like(gray)
+    for k in (51, 101):
+        bg = cv2.medianBlur(g_u8, k).astype(np.float32)
+        ink = np.maximum(ink, np.abs(gray - bg))
+    x0, y0 = max(0, x - search_pad), max(0, y - search_pad)
+    x1, y1 = min(W, x + w + search_pad), min(H, y + h + search_pad)
+    window = ink[y0:y1, x0:x1]
+
+    best = None
+    default_score = 0.0
+    for s in scales:
+        tw, th = int(round(w * s)), int(round(h * s))
+        if th >= window.shape[0] or tw >= window.shape[1]:
+            continue
+        tpl = cv2.resize(work.alpha, (tw, th), interpolation=cv2.INTER_AREA)
+        res = cv2.matchTemplate(window.astype(np.float32), tpl.astype(np.float32),
+                                cv2.TM_CCOEFF_NORMED)
+        _, mx, _, ml = cv2.minMaxLoc(res)
+        if abs(s - 1.0) < 1e-6:
+            ry, rx = y - y0, x - x0
+            if 0 <= ry < res.shape[0] and 0 <= rx < res.shape[1]:
+                default_score = float(res[ry, rx])
+        if best is None or mx > best[0]:
+            best = (mx, s, x0 + ml[0], y0 + ml[1])
+    # Re-place the matte only when the alternative beats the default
+    # placement decisively — a weak lock elsewhere must never displace a
+    # correct default (the 1500px exports always match the default).
+    if best is None or best[0] < 0.10 or best[0] < 1.4 * max(default_score, 0.05):
+        return work
+    _, s, nx, ny = best
+    tw, th = int(round(w * s)), int(round(h * s))
+    alpha = cv2.resize(work.alpha, (tw, th), interpolation=cv2.INTER_AREA)
+    alpha_w = cv2.resize(work.alpha_w, (tw, th), interpolation=cv2.INTER_AREA)
+    tw = min(tw, W - nx)
+    th = min(th, H - ny)
+    return WatermarkModel((nx, ny, tw, th), alpha[:th, :tw], alpha_w[:th, :tw],
+                          image_rgb.shape[:2])
+
+
 def mask_from_flat_template(template_rgb: np.ndarray, ink_thresh: float = 2.5,
                             dilate_px: int = 3) -> np.ndarray:
     """Watermark footprint from a logo file flattened on white: ink is any

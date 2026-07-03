@@ -132,7 +132,8 @@ def cleanup_residual(image_rgb: np.ndarray, model: WatermarkModel,
     resid_cap = a_local * 220.0 + 14.0
     real_object = resid > resid_cap
 
-    bad = ((resid > thresh_map) & (foot > 0) & ~real_object).astype(np.uint8) * 255
+    ink = model.alpha > 0.10  # only true watermark strokes, not the halo
+    bad = ((resid > thresh_map) & ink & ~real_object).astype(np.uint8) * 255
     out = image_rgb
     if bad.any():
         bad = cv2.dilate(bad, np.ones((3, 3), np.uint8))
