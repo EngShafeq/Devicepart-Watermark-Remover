@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+output*/
+samples/*.jpeg
+samples/*.png
+.pytest_cache/
+samples/*.npz
