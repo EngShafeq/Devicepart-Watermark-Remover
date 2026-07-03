@@ -92,8 +92,12 @@ def cmd_remove(args: argparse.Namespace) -> None:
         name = os.path.basename(item.path)
         try:
             if net is not None and _model_fits(model, item.rgb.shape[:2]):
+                from . import estimate as est
                 from . import neural
-                out = neural.remove_neural(item.rgb, model, net)
+                reg = est.register_model(item.rgb, model)
+                out = neural.remove_neural(item.rgb, reg, net)
+                if not args.no_cleanup:
+                    out = remove.cleanup_residual(out, reg)
                 how = "neural"
             elif _model_fits(model, item.rgb.shape[:2]):
                 out = remove.remove_unblend(item.rgb, model)
