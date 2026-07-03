@@ -5,3 +5,4 @@ samples/*.jpeg
 samples/*.png
 .pytest_cache/
 samples/*.npz
+verify_out/
