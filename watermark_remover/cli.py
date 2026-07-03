@@ -108,11 +108,13 @@ def cmd_remove(args: argparse.Namespace) -> None:
                 out = neural.remove_neural(item.rgb, reg, net)
                 if do_cleanup:
                     out = remove.cleanup_residual(out, reg)
+                out = remove.suppress_chroma_residual(out, reg)
                 how = "neural"
             elif model is not None:
                 out = remove.remove_unblend(item.rgb, model)
                 if do_cleanup:
                     out = remove.cleanup_residual(out, model)
+                out = remove.suppress_chroma_residual(out, model)
                 how = "unblend"
             else:
                 mask = _build_mask(item.rgb, template, fixed_bbox)

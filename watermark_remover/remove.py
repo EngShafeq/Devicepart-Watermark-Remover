@@ -161,6 +161,55 @@ def cleanup_residual(image_rgb: np.ndarray, model: WatermarkModel,
     return out
 
 
+def suppress_chroma_residual(image_rgb: np.ndarray, model: WatermarkModel,
+                             strength: float = 0.85) -> np.ndarray:
+    """The watermark is neutral gray, so it cannot shift chroma by more than
+    ~alpha * its own (small) color cast.  Colored specks inside the footprint
+    after unblending are therefore JPEG chroma noise amplified by the
+    division — pull them back toward the local background chroma.  Large
+    chroma deviations are genuinely colored objects (cables, stickers,
+    labels) and are left untouched."""
+    if image_rgb.shape[:2] != model.image_shape:
+        model = model.rescaled(image_rgb.shape[:2])
+    x, y, w, h = model.bbox
+    crop = np.clip(image_rgb[y:y + h, x:x + w], 0, 255).astype(np.float32)
+    foot = cv2.dilate((model.alpha > 0.03).astype(np.uint8) * 255,
+                      np.ones((5, 5), np.uint8))
+    ycc = cv2.cvtColor(crop.astype(np.uint8), cv2.COLOR_RGB2YCrCb).astype(np.float32)
+    bg = cv2.inpaint(crop.astype(np.uint8), foot, 7, cv2.INPAINT_TELEA)
+    bg_ycc = cv2.cvtColor(bg, cv2.COLOR_RGB2YCrCb).astype(np.float32)
+
+    delta = ycc[:, :, 1:] - bg_ycc[:, :, 1:]
+    cap = (model.alpha * 45.0 + 8.0)[..., None]
+    spurious = (np.abs(delta) <= cap) & (foot[..., None] > 0)
+    ycc[:, :, 1:] = np.where(spurious, bg_ycc[:, :, 1:] + delta * (1 - strength),
+                             ycc[:, :, 1:])
+
+    # Gentler luma pass, only on strong-ink pixels: a leftover there is
+    # bounded by the alpha capacity; real print/text deviates far beyond it
+    # and stays untouched.
+    # Tiny isolated specks of strong luma deviation are clipped-JPEG
+    # artifacts, not print: real characters are large connected shapes
+    # (hundreds of pixels), specks are compact blobs.  Suppress only the
+    # specks — a blanket luma correction would fade genuine faint print.
+    dl = ycc[:, :, 0] - bg_ycc[:, :, 0]
+    over = ((np.abs(dl) > 12.0) & (model.alpha > 0.10)).astype(np.uint8)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(over, connectivity=8)
+    speck = np.zeros_like(over, dtype=bool)
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] < 90:
+            speck |= (lab == i)
+    ycc[:, :, 0] = np.where(speck, bg_ycc[:, :, 0] + dl * 0.15, ycc[:, :, 0])
+    ycc[:, :, 1:] = np.where(speck[..., None],
+                             bg_ycc[:, :, 1:] + delta * 0.15, ycc[:, :, 1:])
+    fixed = cv2.cvtColor(np.clip(ycc, 0, 255).astype(np.uint8),
+                         cv2.COLOR_YCrCb2RGB).astype(np.float32)
+    out = image_rgb.astype(np.float32).copy()
+    # luma stays from the original crop; only chroma was touched
+    out[y:y + h, x:x + w] = fixed
+    return out
+
+
 def region_metrics(a: np.ndarray, b: np.ndarray, bbox: tuple[int, int, int, int]) -> dict:
     """PSNR / SSIM restricted to the watermark bounding box — the honest
     measure of removal quality."""
