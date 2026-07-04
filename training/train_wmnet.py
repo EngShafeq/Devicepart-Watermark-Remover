@@ -155,6 +155,9 @@ def main():
     val_x, val_y, val_m = PairMaker(models, args.backgrounds, seed=999).batch(12)
 
     net = WMNet()
+    if os.path.exists(args.out):  # warm start so training chunks accumulate
+        net.load_state_dict(torch.load(args.out, map_location="cpu", weights_only=True))
+        print(f"warm start from {args.out}")
     print(f"params: {sum(p.numel() for p in net.parameters())/1e3:.0f}k")
     opt = torch.optim.Adam(net.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.steps)
