@@ -121,6 +121,10 @@ def remove_neural(image_rgb: np.ndarray, model, net,
                 # hallucinate beyond what the blend model allows
                 cap = (mp[:ph, :pw, None] * 220.0 + 14.0) / 255.0
                 resid = np.clip(resid, -cap, cap)
+                # never darken a pixel below ~5/255: a positive residual
+                # (darkening) larger than the pixel's own brightness would
+                # stamp pure black, which no watermark leftover explains
+                resid = np.minimum(resid, np.maximum(patch[:ph, :pw] - 0.02, 0.0))
                 pred = patch[:ph, :pw] - resid
                 # stitch with feathered borders
                 wy = np.ones(ph, np.float32)

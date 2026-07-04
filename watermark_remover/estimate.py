@@ -184,8 +184,8 @@ def estimate_watermark(
 
 
 def register_model(image_rgb: np.ndarray, model: "WatermarkModel",
-                   scales=(0.85, 0.92, 1.0, 1.08, 1.15),
-                   search_pad: int = 60) -> "WatermarkModel":
+                   scales=(0.8, 0.9, 1.0, 1.1, 1.25, 1.4, 1.55),
+                   search_pad: int = 120) -> "WatermarkModel":
     """Fine-align the watermark matte to one specific image.
 
     Different export sizes of the site stamp the watermark with small

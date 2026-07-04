@@ -121,6 +121,14 @@ def cleanup_residual(image_rgb: np.ndarray, model: WatermarkModel,
     bg = cv2.inpaint(np.clip(gray, 0, 255).astype(np.uint8), foot, 7,
                      cv2.INPAINT_TELEA).astype(np.float32)
     resid = np.abs(gray - bg)
+    # Cleanup relies on the inpainted background being trustworthy, which
+    # holds only when the area around the watermark is smooth (screens,
+    # plates, seamless paper).  On structured areas (keyboards, labelled
+    # parts) the inpaint smears real edges — skip entirely, the unblend +
+    # refiner result stands.
+    outside = resid[foot == 0]
+    if outside.size and float(np.percentile(outside, 85)) > 8.0:
+        return image_rgb
     if thresh is None:
         # Local texture level from the ring just outside the footprint,
         # brought inside by dilation so every footprint pixel sees the
