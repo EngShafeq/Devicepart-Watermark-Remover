@@ -1,0 +1,62 @@
+name: Remove watermarks (with LaMa)
+
+# Runs the full pipeline INCLUDING the LaMa polish, on GitHub's runners
+# where network access is open — so the big-lama weights download fine,
+# unlike the locked-down Claude Code sandbox.
+#
+# How to use:
+#   1. Put watermarked images in the `input/` folder and push, OR
+#   2. Actions tab -> "Remove watermarks (with LaMa)" -> Run workflow.
+# Cleaned images are committed back to the `output/` folder.
+
+on:
+  workflow_dispatch:
+    inputs:
+      use_lama:
+        description: "Apply LaMa polish on the unrecoverable core"
+        type: boolean
+        default: true
+  push:
+    paths:
+      - "input/**"
+
+jobs:
+  remove:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          # LaMa: network is open on the runner, so the weights download works
+          pip install simple-lama-inpainting || echo "LaMa optional install failed; continuing without it"
+
+      - name: Remove watermarks
+        run: |
+          mkdir -p input output
+          shopt -s nullglob
+          imgs=(input/*.{jpg,jpeg,png,webp})
+          if [ ${#imgs[@]} -eq 0 ]; then
+            echo "No images in input/ — add some and re-run."; exit 0
+          fi
+          LAMA=""
+          if [ "${{ github.event.inputs.use_lama }}" != "false" ]; then LAMA="--lama"; fi
+          python -m watermark_remover remove \
+            --input-dir input --output-dir output \
+            --model models/deviceparts_1500.npz,models/deviceparts_1000_tilted.npz \
+            --net models/wmnet.pt $LAMA
+
+      - name: Commit results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add output
+          git diff --cached --quiet || git commit -m "Add cleaned watermark-free images [skip ci]"
+          git push
