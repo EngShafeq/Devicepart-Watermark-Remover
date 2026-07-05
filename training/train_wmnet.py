@@ -208,19 +208,26 @@ def main():
     ap.add_argument("--base", type=int, default=24)
     ap.add_argument("--depth", type=int, default=3)
     ap.add_argument("--grad-weight", type=float, default=0.5)
+    ap.add_argument("--seed", type=int, default=0,
+                    help="varies weight init + synthetic data across rounds")
+    ap.add_argument("--init", default=None,
+                    help="warm-start weights from this checkpoint (arch must "
+                         "match); defaults to --out if it exists")
     args = ap.parse_args()
 
-    torch.manual_seed(0)
+    torch.manual_seed(args.seed)
     models = [estimate.WatermarkModel.load(p) for p in args.model.split(",")]
-    maker = PairMaker(models, args.backgrounds)
-    val_x, val_y, val_m = PairMaker(models, args.backgrounds, seed=999).batch(12)
+    maker = PairMaker(models, args.backgrounds, seed=args.seed)
+    # held-out val uses a reserved seed disjoint from every training round
+    val_x, val_y, val_m = PairMaker(models, args.backgrounds, seed=90000).batch(16)
 
     net = WMNet(base=args.base, depth=args.depth)
-    if os.path.exists(args.out):  # warm start only if the checkpoint arch matches
+    warm = args.init if args.init else args.out
+    if warm and os.path.exists(warm):  # warm start only if the arch matches
         try:
-            net.load_state_dict(torch.load(args.out, map_location="cpu",
+            net.load_state_dict(torch.load(warm, map_location="cpu",
                                            weights_only=True))
-            print(f"warm start from {args.out}")
+            print(f"warm start from {warm}")
         except Exception:
             print("checkpoint arch mismatch; training the new arch from scratch")
     print(f"params: {sum(p.numel() for p in net.parameters())/1e3:.0f}k "
