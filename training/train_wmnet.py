@@ -193,7 +193,10 @@ def main():
     # overwrites a good checkpoint with an under-converged one.
     with torch.no_grad():
         vp0 = net(val_x)
-        best = ((val_x[:, :3] - vp0 - (val_x[:, :3] - val_y)) ** 2).mean().item()
+        cp0 = val_x[:, :3] - vp0
+        ct0 = val_x[:, :3] - val_y
+        best = ((cp0 - ct0) ** 2).mean().item() \
+            + args.grad_weight * _grad_loss(cp0, ct0).item()
     ema_net = None
     ema_decay = 0.997
     for step in range(1, args.steps + 1):
@@ -225,11 +228,14 @@ def main():
                 cp = val_x[:, :3] - vp
                 ct = val_x[:, :3] - val_y
                 mse = ((cp - ct) ** 2).mean().item()
+                # save on the combined objective (pixel + edge) so gains in
+                # text/edge crispness are captured, not just flat-area MSE
+                score = mse + args.grad_weight * _grad_loss(cp, ct).item()
                 psnr = -10 * np.log10(mse + 1e-12)
             print(f"step {step:5d}  loss {loss.item():.4f}  val-PSNR {psnr:.2f} dB  "
                   f"({(time.time()-t0)/60:.1f} min)", flush=True)
-            if mse < best:
-                best = mse
+            if score < best:
+                best = score
                 torch.save(ema_net.state_dict(), args.out)
     print(f"done; best val PSNR {-10*np.log10(best+1e-12):.2f} dB -> {args.out}")
 
