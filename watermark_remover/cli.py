@@ -110,6 +110,9 @@ def cmd_remove(args: argparse.Namespace) -> None:
                     out = remove.cleanup_residual(out, reg)
                 out = remove.suppress_chroma_residual(out, reg)
                 out = remove.flatten_lowfreq_residual(out, reg)
+                if args.lama:
+                    from . import lama
+                    out = lama.refine_with_lama(out, reg)
                 how = "neural"
             elif model is not None:
                 out = remove.remove_unblend(item.rgb, model)
@@ -117,6 +120,9 @@ def cmd_remove(args: argparse.Namespace) -> None:
                     out = remove.cleanup_residual(out, model)
                 out = remove.suppress_chroma_residual(out, model)
                 out = remove.flatten_lowfreq_residual(out, model)
+                if args.lama:
+                    from . import lama
+                    out = lama.refine_with_lama(out, model)
                 how = "unblend"
             else:
                 mask = _build_mask(item.rgb, template, fixed_bbox)
@@ -197,6 +203,11 @@ def main(argv: list[str] | None = None) -> None:
     r.add_argument("--net", default=None,
                    help="trained WMNet weights (.pt) — uses the neural remover "
                         "instead of the analytic unblend (requires torch)")
+    r.add_argument("--lama", action="store_true",
+                   help="final LaMa inpainting polish on the unrecoverable "
+                        "near-opaque core (needs `pip install "
+                        "simple-lama-inpainting` + network for weights; "
+                        "no-op if unavailable)")
     r.set_defaults(func=cmd_remove)
 
     d = sub.add_parser("detect", parents=[common],
