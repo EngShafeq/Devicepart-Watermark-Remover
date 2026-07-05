@@ -223,6 +223,57 @@ def suppress_chroma_residual(image_rgb: np.ndarray, model: WatermarkModel,
     return out
 
 
+def flatten_lowfreq_residual(image_rgb: np.ndarray, model: WatermarkModel,
+                             sigma: float = 9.0, strength: float = 0.9) -> np.ndarray:
+    """Remove the low-frequency brightness ghost the refiner leaves on dark
+    textured products, while preserving all high-frequency detail (real
+    texture, print, noise).
+
+    Experiments showed the stubborn residue on chips/keyboards is not a
+    sharp mark but a smooth *low-frequency* intensity deviation from the
+    surrounding surface.  So we split the footprint into low- and
+    high-frequency bands: correct only the low band toward the clean
+    background level, and add the original high band back untouched.  Real
+    characters keep their high-frequency edges; the smudge (pure low-freq)
+    is flattened away.  The correction is capped by the physical alpha
+    bound and confined to the footprint, so it can neither invent content
+    nor touch clean pixels."""
+    if image_rgb.shape[:2] != model.image_shape:
+        model = model.rescaled(image_rgb.shape[:2])
+    x, y, w, h = model.bbox
+    crop = np.clip(image_rgb[y:y + h, x:x + w], 0, 255).astype(np.float32)
+    foot = (model.alpha > 0.04).astype(np.uint8) * 255
+    if not foot.any():
+        return image_rgb
+
+    # Clean background reference: inpaint the footprint from its surroundings,
+    # then keep only its low-frequency component (the surface's slow shading).
+    bg = cv2.inpaint(crop.astype(np.uint8), cv2.dilate(foot, np.ones((5, 5), np.uint8)),
+                     7, cv2.INPAINT_TELEA).astype(np.float32)
+    lf_crop = cv2.GaussianBlur(crop, (0, 0), sigma)
+    lf_bg = cv2.GaussianBlur(bg, (0, 0), sigma)
+
+    # Low-frequency deviation = the ghost.  Cap it to what the watermark
+    # could physically have caused so real low-freq shading is never flipped.
+    dev = lf_crop - lf_bg
+    cap = (model.alpha * 80.0 + 6.0)[..., None]
+    dev = np.clip(dev, -cap, cap)
+
+    # Feathered footprint weight, and only correct where a real *smooth*
+    # ghost exists (not sharp text): down-weight where the high-frequency
+    # energy of the crop is strong (that's genuine print/edges to protect).
+    hf = crop - lf_crop
+    hf_energy = cv2.GaussianBlur(np.abs(hf).mean(axis=2), (0, 0), 3.0)
+    smooth_w = np.clip(1.0 - hf_energy / 18.0, 0.0, 1.0)
+    fw = cv2.GaussianBlur((foot > 0).astype(np.float32), (0, 0), 2.0)
+    weight = (fw * smooth_w)[..., None] * strength
+
+    corrected = crop - dev * weight
+    out = image_rgb.astype(np.float32).copy()
+    out[y:y + h, x:x + w] = np.clip(corrected, 0, 255)
+    return out
+
+
 def region_metrics(a: np.ndarray, b: np.ndarray, bbox: tuple[int, int, int, int]) -> dict:
     """PSNR / SSIM restricted to the watermark bounding box — the honest
     measure of removal quality."""
