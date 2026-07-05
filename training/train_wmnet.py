@@ -139,6 +139,24 @@ class PairMaker:
                 torch.from_numpy(np.stack(ms)).float())
 
 
+_SOBEL_X = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]]).view(1, 1, 3, 3)
+_SOBEL_Y = _SOBEL_X.transpose(2, 3)
+
+
+def _grad_loss(pred, tgt):
+    """L1 on Sobel gradients — penalises edge/text errors specifically, so
+    the refiner keeps chip prints and label strokes crisp instead of
+    smearing them."""
+    c = pred.shape[1]
+    kx = _SOBEL_X.repeat(c, 1, 1, 1).to(pred.device)
+    ky = _SOBEL_Y.repeat(c, 1, 1, 1).to(pred.device)
+    gpx = F.conv2d(pred, kx, padding=1, groups=c)
+    gpy = F.conv2d(pred, ky, padding=1, groups=c)
+    gtx = F.conv2d(tgt, kx, padding=1, groups=c)
+    gty = F.conv2d(tgt, ky, padding=1, groups=c)
+    return (gpx - gtx).abs().mean() + (gpy - gty).abs().mean()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -147,6 +165,9 @@ def main():
     ap.add_argument("--steps", type=int, default=1200)
     ap.add_argument("--batch", type=int, default=6)
     ap.add_argument("--lr", type=float, default=2e-3)
+    ap.add_argument("--base", type=int, default=24)
+    ap.add_argument("--depth", type=int, default=3)
+    ap.add_argument("--grad-weight", type=float, default=0.5)
     args = ap.parse_args()
 
     torch.manual_seed(0)
@@ -154,38 +175,62 @@ def main():
     maker = PairMaker(models, args.backgrounds)
     val_x, val_y, val_m = PairMaker(models, args.backgrounds, seed=999).batch(12)
 
-    net = WMNet()
-    if os.path.exists(args.out):  # warm start so training chunks accumulate
-        net.load_state_dict(torch.load(args.out, map_location="cpu", weights_only=True))
-        print(f"warm start from {args.out}")
-    print(f"params: {sum(p.numel() for p in net.parameters())/1e3:.0f}k")
+    net = WMNet(base=args.base, depth=args.depth)
+    if os.path.exists(args.out):  # warm start only if the checkpoint arch matches
+        try:
+            net.load_state_dict(torch.load(args.out, map_location="cpu",
+                                           weights_only=True))
+            print(f"warm start from {args.out}")
+        except Exception:
+            print("checkpoint arch mismatch; training the new arch from scratch")
+    print(f"params: {sum(p.numel() for p in net.parameters())/1e3:.0f}k "
+          f"(base={args.base} depth={args.depth})")
     opt = torch.optim.Adam(net.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.steps)
 
     t0 = time.time()
-    best = 1e9
+    # Seed `best` with the warm-started model's score so a resumed run never
+    # overwrites a good checkpoint with an under-converged one.
+    with torch.no_grad():
+        vp0 = net(val_x)
+        best = ((val_x[:, :3] - vp0 - (val_x[:, :3] - val_y)) ** 2).mean().item()
+    ema_net = None
+    ema_decay = 0.997
     for step in range(1, args.steps + 1):
         x, ytgt, m = maker.batch(args.batch)
         pred = net(x)
         # weight loss toward watermark pixels but keep global fidelity
         wmap = 1.0 + 9.0 * m[:, None]
-        loss = (wmap * (pred - ytgt).abs()).mean()
+        clean_pred = x[:, :3] - pred
+        clean_true = x[:, :3] - ytgt
+        loss = (wmap * (pred - ytgt).abs()).mean() \
+            + args.grad_weight * _grad_loss(clean_pred, clean_true)
         opt.zero_grad()
         loss.backward()
         opt.step()
         sched.step()
+        # EMA of weights — the smoothed model generalises better and is what
+        # we evaluate/save (a standard best-practice for final quality).
+        with torch.no_grad():
+            if ema_net is None:
+                ema_net = WMNet(base=args.base, depth=args.depth)
+                ema_net.load_state_dict(net.state_dict())
+            for pe, pn in zip(ema_net.parameters(), net.parameters()):
+                pe.mul_(ema_decay).add_(pn, alpha=1 - ema_decay)
+            for be, bn in zip(ema_net.buffers(), net.buffers()):
+                be.copy_(bn)
         if step % 50 == 0 or step == args.steps:
             with torch.no_grad():
-                vp = net(val_x)
-                clean_pred = val_x[:, :3] - vp
-                clean_true = val_x[:, :3] - val_y
-                mse = ((clean_pred - clean_true) ** 2).mean().item()
+                vp = ema_net(val_x)
+                cp = val_x[:, :3] - vp
+                ct = val_x[:, :3] - val_y
+                mse = ((cp - ct) ** 2).mean().item()
                 psnr = -10 * np.log10(mse + 1e-12)
             print(f"step {step:5d}  loss {loss.item():.4f}  val-PSNR {psnr:.2f} dB  "
                   f"({(time.time()-t0)/60:.1f} min)", flush=True)
             if mse < best:
                 best = mse
-                torch.save(net.state_dict(), args.out)
+                torch.save(ema_net.state_dict(), args.out)
     print(f"done; best val PSNR {-10*np.log10(best+1e-12):.2f} dB -> {args.out}")
 
 

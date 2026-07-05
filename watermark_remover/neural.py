@@ -43,7 +43,68 @@ if TORCH_OK:
             return self.net(x)
 
     class WMNet(nn.Module):
-        """Small 3-scale residual U-Net (~450k params)."""
+        """Residual U-Net.  ``depth`` scales, ``base`` channels at full res.
+
+        The default (base=24, depth=3) is the compact ~260k-param model;
+        base=40, depth=4 is the higher-capacity variant that resolves more
+        of the dark-texture residue.  Architecture is fully recoverable
+        from a checkpoint's tensor shapes, so ``load_net`` auto-detects it.
+        """
+
+        def __init__(self, base=24, depth=3):
+            super().__init__()
+            self.depth = depth
+            self.pool = nn.MaxPool2d(2)
+            self.enc = nn.ModuleList()
+            cin = 4
+            for d in range(depth):
+                self.enc.append(_Block(cin, base * (2 ** d)))
+                cin = base * (2 ** d)
+            self.ups = nn.ModuleList()
+            self.dec = nn.ModuleList()
+            for d in range(depth - 1, 0, -1):
+                self.ups.append(nn.ConvTranspose2d(base * (2 ** d),
+                                                   base * (2 ** (d - 1)), 2, stride=2))
+                self.dec.append(_Block(base * (2 ** d), base * (2 ** (d - 1))))
+            self.out = nn.Conv2d(base, 3, 1)
+
+        def forward(self, x):
+            feats = []
+            h = x
+            for d in range(self.depth):
+                h = self.enc[d](h if d == 0 else self.pool(h))
+                feats.append(h)
+            h = feats[-1]
+            for i, d in enumerate(range(self.depth - 1, 0, -1)):
+                h = self.dec[i](torch.cat([self.ups[i](h), feats[d - 1]], 1))
+            return self.out(h)
+
+
+def _infer_arch(state: dict) -> tuple[int, int]:
+    """Recover (base, depth) from a checkpoint's tensor shapes."""
+    base = state["enc.0.net.0.weight"].shape[0]
+    depth = sum(1 for k in state if k.endswith(".net.0.weight") and k.startswith("enc."))
+    return int(base), int(depth)
+
+
+def load_net(weights_path: str, device: str = "cpu"):
+    if not TORCH_OK:
+        raise RuntimeError("PyTorch is not installed; pip install torch")
+    state = torch.load(weights_path, map_location=device, weights_only=True)
+    if "enc.0.net.0.weight" in state:               # new flexible layout
+        base, depth = _infer_arch(state)
+        net = WMNet(base=base, depth=depth)
+        net.load_state_dict(state)
+    else:                                            # legacy enc1/enc2/enc3 layout
+        net = _LegacyWMNet()
+        net.load_state_dict(state)
+    net.eval()
+    return net
+
+
+if TORCH_OK:
+    class _LegacyWMNet(nn.Module):
+        """Loads the original enc1/enc2/enc3 checkpoints for compatibility."""
 
         def __init__(self, base=24):
             super().__init__()
@@ -66,20 +127,40 @@ if TORCH_OK:
             return self.out(d1)
 
 
-def load_net(weights_path: str, device: str = "cpu"):
-    if not TORCH_OK:
-        raise RuntimeError("PyTorch is not installed; pip install torch")
-    net = WMNet()
-    state = torch.load(weights_path, map_location=device, weights_only=True)
-    net.load_state_dict(state)
-    net.eval()
-    return net
+def _tta_residual(net, inp: np.ndarray) -> np.ndarray:
+    """8-way (D4) test-time augmentation: run the net on every flip/rotation
+    of the input, invert the transform on each output, and average.  This
+    removes the network's orientation bias and visibly reduces residue on
+    hard textures — a free inference-time accuracy gain."""
+    # inp: HxWx4 (rgb + matte).  Transforms act on H,W only.
+    variants = []
+    for k in range(4):        # 4 rotations
+        for flip in (False, True):
+            t = np.rot90(inp, k, axes=(0, 1))
+            if flip:
+                t = t[:, ::-1]
+            variants.append(t)
+    accum = None
+    with torch.no_grad():
+        for k in range(4):
+            for flip in (False, True):
+                idx = k * 2 + int(flip)
+                v = np.ascontiguousarray(variants[idx].transpose(2, 0, 1))
+                r = net(torch.from_numpy(v)[None])[0].numpy().transpose(1, 2, 0)
+                # invert: undo flip, then undo rotation
+                if flip:
+                    r = r[:, ::-1]
+                r = np.rot90(r, -k, axes=(0, 1))
+                accum = r if accum is None else accum + r
+    return accum / 8.0
 
 
 def remove_neural(image_rgb: np.ndarray, model, net,
-                  tile: int = 256, overlap: int = 32) -> np.ndarray:
+                  tile: int = 256, overlap: int = 32, tta: bool = False) -> np.ndarray:
     """Run the network over the watermark region of ``image_rgb`` using the
-    WatermarkModel for the matte + footprint.  Returns a new image."""
+    WatermarkModel for the matte + footprint.  Returns a new image.
+
+    ``tta`` enables 8-way test-time augmentation (slower, more accurate)."""
     if not TORCH_OK:
         raise RuntimeError("PyTorch is not installed; pip install torch")
     from .remove import remove_unblend  # analytic first pass
@@ -114,8 +195,11 @@ def remove_neural(image_rgb: np.ndarray, model, net,
                     patch = np.pad(patch, ((0, py), (0, px), (0, 0)), mode="reflect")
                     mp = np.pad(mp, ((0, py), (0, px)), mode="reflect")
                 inp = np.concatenate([patch, mp[..., None]], axis=2)
-                t = torch.from_numpy(inp.transpose(2, 0, 1))[None]
-                resid = net(t)[0].numpy().transpose(1, 2, 0)[:ph, :pw]
+                if tta:
+                    resid = _tta_residual(net, inp)[:ph, :pw]
+                else:
+                    t = torch.from_numpy(inp.transpose(2, 0, 1))[None]
+                    resid = net(t)[0].numpy().transpose(1, 2, 0)[:ph, :pw]
                 # physical bound: a leftover of the watermark cannot exceed
                 # ~alpha*220 + 14; clip the correction so the net can never
                 # hallucinate beyond what the blend model allows
