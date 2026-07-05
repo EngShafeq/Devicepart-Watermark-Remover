@@ -60,6 +60,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add output
+          git add -f output          # output/ is gitignored locally; force-track CI results
           git diff --cached --quiet || git commit -m "Add cleaned watermark-free images [skip ci]"
           git push
