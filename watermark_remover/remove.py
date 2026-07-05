@@ -224,7 +224,7 @@ def suppress_chroma_residual(image_rgb: np.ndarray, model: WatermarkModel,
 
 
 def flatten_lowfreq_residual(image_rgb: np.ndarray, model: WatermarkModel,
-                             sigma: float = 9.0, strength: float = 0.9) -> np.ndarray:
+                             sigma: float = 6.0, strength: float = 1.0) -> np.ndarray:
     """Remove the low-frequency brightness ghost the refiner leaves on dark
     textured products, while preserving all high-frequency detail (real
     texture, print, noise).
