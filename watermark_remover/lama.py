@@ -43,13 +43,23 @@ def _load():
 
 
 def refine_with_lama(image_rgb: np.ndarray, model, min_alpha: float = 0.6,
-                     grow: int = 3) -> np.ndarray:
-    """Inpaint the unrecoverable core of the watermark with LaMa.
+                     grow: int = 3, protect_text: bool = True,
+                     text_thresh: float = 10.0) -> np.ndarray:
+    """Inpaint the *unrecoverable, texture-less* core of the watermark.
 
-    Only the near-opaque footprint (``alpha >= min_alpha``) is masked — the
-    small region where the blend is uninvertible — so recoverable detail
-    and real print outside it are preserved.  Returns the input unchanged
-    if LaMa is unavailable.
+    Two guards keep LaMa from destroying real content:
+
+    1. Only the near-opaque footprint (``alpha >= min_alpha``) is masked —
+       the small region where the analytic blend is uninvertible.
+    2. ``protect_text``: any pixel that still carries strong high-frequency
+       structure (chip prints, label strokes, connector edges) is *removed*
+       from the mask.  LaMa is a generic inpainter — it synthesises flat,
+       plausible texture and has no notion that a character belongs there,
+       so left unchecked it erases print under the watermark.  We hand it
+       only the genuinely flat, JPEG-crushed pixels where no character
+       survives, and leave every recoverable stroke to the refiner.
+
+    Returns the input unchanged if LaMa is unavailable.
     """
     lama = _load()
     if lama is None:
@@ -58,16 +68,11 @@ def refine_with_lama(image_rgb: np.ndarray, model, min_alpha: float = 0.6,
     import cv2
     from PIL import Image
 
-    if image_rgb.shape[:2] != model.image_shape:
-        model = model.rescaled(image_rgb.shape[:2])
-    x, y, w, h = model.bbox
-    core = (model.alpha >= min_alpha).astype(np.uint8)
-    if core.sum() == 0:
+    from ._inpaint_mask import build_core_mask
+    full = build_core_mask(image_rgb, model, min_alpha, grow,
+                           protect_text, text_thresh)
+    if full.sum() == 0:                       # nothing flat/opaque left to fill
         return image_rgb
-    full = np.zeros(image_rgb.shape[:2], np.uint8)
-    full[y:y + h, x:x + w] = core
-    if grow > 0:
-        full = cv2.dilate(full, np.ones((2 * grow + 1,) * 2, np.uint8))
 
     rgb = np.clip(image_rgb, 0, 255).astype(np.uint8)
     result = lama(Image.fromarray(rgb), Image.fromarray(full * 255))

@@ -12,10 +12,11 @@ name: Remove watermarks (with LaMa)
 on:
   workflow_dispatch:
     inputs:
-      use_lama:
-        description: "Apply LaMa polish on the unrecoverable core"
-        type: boolean
-        default: true
+      inpaint:
+        description: "Inpainting backend for the unrecoverable core"
+        type: choice
+        options: ["mat", "lama", "none"]
+        default: "mat"
   push:
     paths:
       - "input/**"
@@ -38,8 +39,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          # LaMa: network is open on the runner, so the weights download works
-          pip install simple-lama-inpainting || echo "LaMa optional install failed; continuing without it"
+          # Inpainting back-ends — network is open on the runner, so weights
+          # download fine.  MAT (structure-aware) ships in IOPaint; LaMa is the
+          # lighter flat-fill fallback.
+          pip install iopaint || echo "IOPaint (MAT) optional install failed; continuing"
+          pip install simple-lama-inpainting || echo "LaMa optional install failed; continuing"
 
       - name: Remove watermarks
         run: |
@@ -49,12 +53,12 @@ jobs:
           if [ ${#imgs[@]} -eq 0 ]; then
             echo "No images in input/ — add some and re-run."; exit 0
           fi
-          LAMA=""
-          if [ "${{ github.event.inputs.use_lama }}" != "false" ]; then LAMA="--lama"; fi
+          INPAINT="${{ github.event.inputs.inpaint }}"
+          INPAINT="${INPAINT:-mat}"     # default when triggered by push
           python -m watermark_remover remove \
             --input-dir input --output-dir output \
             --model models/deviceparts_1500.npz,models/deviceparts_1000_tilted.npz \
-            --net models/wmnet.pt $LAMA
+            --net models/wmnet.pt --inpaint "$INPAINT"
 
       - name: Commit results
         run: |

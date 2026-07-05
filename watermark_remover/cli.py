@@ -110,9 +110,7 @@ def cmd_remove(args: argparse.Namespace) -> None:
                     out = remove.cleanup_residual(out, reg)
                 out = remove.suppress_chroma_residual(out, reg)
                 out = remove.flatten_lowfreq_residual(out, reg)
-                if args.lama:
-                    from . import lama
-                    out = lama.refine_with_lama(out, reg)
+                out = _apply_inpaint(out, reg, args)
                 how = "neural"
             elif model is not None:
                 out = remove.remove_unblend(item.rgb, model)
@@ -120,9 +118,7 @@ def cmd_remove(args: argparse.Namespace) -> None:
                     out = remove.cleanup_residual(out, model)
                 out = remove.suppress_chroma_residual(out, model)
                 out = remove.flatten_lowfreq_residual(out, model)
-                if args.lama:
-                    from . import lama
-                    out = lama.refine_with_lama(out, model)
+                out = _apply_inpaint(out, model, args)
                 how = "unblend"
             else:
                 mask = _build_mask(item.rgb, template, fixed_bbox)
@@ -144,6 +140,24 @@ def cmd_remove(args: argparse.Namespace) -> None:
 
     with open(os.path.join(args.output_dir, "report.json"), "w") as fh:
         json.dump(report, fh, indent=2)
+
+
+def _apply_inpaint(out, model, args):
+    """Optional final inpainting polish on the unrecoverable core.
+
+    Backend chosen by --inpaint (mat = structure-aware, lama = flat fill);
+    --lama is kept as an alias for --inpaint lama.  Each is a graceful
+    no-op when its package/weights are absent."""
+    backend = args.inpaint
+    if backend == "none" and args.lama:
+        backend = "lama"
+    if backend == "mat":
+        from . import mat
+        return mat.refine_with_mat(out, model)
+    if backend == "lama":
+        from . import lama
+        return lama.refine_with_lama(out, model)
+    return out
 
 
 def _build_mask(image_rgb, template_rgba, fixed_bbox):
@@ -203,11 +217,13 @@ def main(argv: list[str] | None = None) -> None:
     r.add_argument("--net", default=None,
                    help="trained WMNet weights (.pt) — uses the neural remover "
                         "instead of the analytic unblend (requires torch)")
+    r.add_argument("--inpaint", choices=["none", "lama", "mat"], default="none",
+                   help="final inpainting polish on the unrecoverable near-opaque "
+                        "core: 'mat' is structure-aware (IOPaint, best on edges), "
+                        "'lama' is flat-fill; both protect real print and are a "
+                        "no-op if their weights are unavailable")
     r.add_argument("--lama", action="store_true",
-                   help="final LaMa inpainting polish on the unrecoverable "
-                        "near-opaque core (needs `pip install "
-                        "simple-lama-inpainting` + network for weights; "
-                        "no-op if unavailable)")
+                   help="alias for --inpaint lama (kept for back-compat)")
     r.set_defaults(func=cmd_remove)
 
     d = sub.add_parser("detect", parents=[common],

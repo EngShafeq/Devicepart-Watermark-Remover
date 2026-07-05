@@ -32,3 +32,4 @@ REG5/
 fit1500_all/
 REG6/
 scratch_lama_out/
+models/wmnet_deep.pt

@@ -54,15 +54,55 @@ class PairMaker:
         if not self.bgs:
             raise SystemExit(f"no backgrounds found in {bg_dir}")
 
+    def _text_patch(self) -> np.ndarray:
+        """Synthetic chip/label print: rows of characters on a substrate.
+
+        This is the class the refiner previously never saw — so it learned
+        to flatten the watermark footprint without any prior that *print*
+        lives there.  Training on it teaches the network to reconstruct
+        strokes under the mark instead of smearing them, which is exactly
+        where the visible text loss came from."""
+        r = self.rng
+        dark_chip = r.random() < 0.6
+        if dark_chip:                              # black IC body, light print
+            base = r.uniform(8, 55)
+            ink = r.uniform(150, 235)
+        else:                                      # light label, dark print
+            base = r.uniform(200, 250)
+            ink = r.uniform(10, 70)
+        tint = r.uniform(-5, 5, 3)
+        # cv2.putText needs a uint8 canvas (OpenCV 5); render then float-cast
+        canvas = np.clip(np.full((PATCH, PATCH, 3), base) + tint, 0, 255).astype(np.uint8)
+        chars = "ABCDEFGHJKLMNPQRSTUVWXYZ0123456789-"
+        n_rows = int(r.integers(2, 6))
+        scale = float(r.uniform(0.5, 1.4))
+        thick = int(r.integers(1, 3))
+        col = (int(ink), int(ink), int(ink))
+        for i in range(n_rows):
+            py = int((i + 0.7) * PATCH / (n_rows + 1))
+            px = int(r.integers(4, PATCH // 3))
+            s = "".join(chars[int(r.integers(len(chars)))]
+                        for _ in range(int(r.integers(4, 11))))
+            cv2.putText(canvas, s, (px, py), cv2.FONT_HERSHEY_SIMPLEX,
+                        scale, col, thick, cv2.LINE_AA)
+        patch = canvas.astype(np.float32)
+        if r.random() < 0.5:                       # slight rotation like real chips
+            angle = r.uniform(-8, 8)
+            M = cv2.getRotationMatrix2D((PATCH / 2, PATCH / 2), angle, 1.0)
+            patch = cv2.warpAffine(patch, M, (PATCH, PATCH), borderMode=cv2.BORDER_REFLECT)
+        return np.clip(patch, 0, 255)
+
     def _bg_patch(self) -> np.ndarray:
         r = self.rng
         kind = r.random()
-        if kind < 0.55:  # real photo crop
+        if kind < 0.45:  # real photo crop
             img = self.bgs[int(r.integers(len(self.bgs)))]
             y = int(r.integers(0, img.shape[0] - PATCH))
             x = int(r.integers(0, img.shape[1] - PATCH))
             return img[y:y + PATCH, x:x + PATCH].copy()
-        if kind < 0.8:  # flat tone (screens, paper) + slight gradient + noise
+        if kind < 0.70:  # chip/label print — teaches text reconstruction
+            return self._text_patch()
+        if kind < 0.88:  # flat tone (screens, paper) + slight gradient + noise
             base = r.uniform(5, 250)
             g = np.linspace(0, r.uniform(-12, 12), PATCH, dtype=np.float32)
             patch = np.full((PATCH, PATCH, 3), base, np.float32)
