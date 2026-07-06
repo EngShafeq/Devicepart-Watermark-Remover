@@ -87,10 +87,24 @@ def _infer_arch(state: dict) -> tuple[int, int]:
     return int(base), int(depth)
 
 
-def load_net(weights_path: str, device: str = "cpu"):
+def _auto_device() -> str:
+    """Pick the fastest available backend: CUDA GPU > Apple MPS > CPU.
+    The neural refiner is ~50-100x faster on a GPU, so use one if present."""
+    if not TORCH_OK:
+        return "cpu"
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def load_net(weights_path: str, device: str | None = None):
     if not TORCH_OK:
         raise RuntimeError("PyTorch is not installed; pip install torch")
-    state = torch.load(weights_path, map_location=device, weights_only=True)
+    if device is None:
+        device = _auto_device()
+    state = torch.load(weights_path, map_location="cpu", weights_only=True)
     if "enc.0.net.0.weight" in state:               # new flexible layout
         base, depth = _infer_arch(state)
         net = WMNet(base=base, depth=depth)
@@ -99,6 +113,11 @@ def load_net(weights_path: str, device: str = "cpu"):
         net = _LegacyWMNet()
         net.load_state_dict(state)
     net.eval()
+    try:
+        net = net.to(device)
+        net._wm_device = device
+    except Exception:                                # unsupported backend -> stay on CPU
+        net._wm_device = "cpu"
     return net
 
 
@@ -146,7 +165,8 @@ def _tta_residual(net, inp: np.ndarray) -> np.ndarray:
             for flip in (False, True):
                 idx = k * 2 + int(flip)
                 v = np.ascontiguousarray(variants[idx].transpose(2, 0, 1))
-                r = net(torch.from_numpy(v)[None])[0].numpy().transpose(1, 2, 0)
+                dev = getattr(net, "_wm_device", "cpu")
+                r = net(torch.from_numpy(v)[None].to(dev))[0].cpu().numpy().transpose(1, 2, 0)
                 # invert: undo flip, then undo rotation
                 if flip:
                     r = r[:, ::-1]
@@ -198,8 +218,9 @@ def remove_neural(image_rgb: np.ndarray, model, net,
                 if tta:
                     resid = _tta_residual(net, inp)[:ph, :pw]
                 else:
-                    t = torch.from_numpy(inp.transpose(2, 0, 1))[None]
-                    resid = net(t)[0].numpy().transpose(1, 2, 0)[:ph, :pw]
+                    dev = getattr(net, "_wm_device", "cpu")
+                    t = torch.from_numpy(inp.transpose(2, 0, 1))[None].to(dev)
+                    resid = net(t)[0].cpu().numpy().transpose(1, 2, 0)[:ph, :pw]
                 # physical bound: a leftover of the watermark cannot exceed
                 # ~alpha*220 + 14; clip the correction so the net can never
                 # hallucinate beyond what the blend model allows
