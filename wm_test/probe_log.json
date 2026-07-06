@@ -1,0 +1,17 @@
+{
+  "url": "https://sora2watermarkremover.net/remove-watermark-from-image",
+  "image": "training/data/backgrounds/9b9960d6-as120987_2304203911_1.jpg",
+  "steps": [
+    "title: Remove Watermark from Image - Free AI Watermark Remover Online",
+    "file inputs found: 1",
+    "uploaded image to first file input",
+    "clicked: Remove Watermark",
+    "clicked: Remove",
+    "clicked: Auto",
+    "clicked: Start",
+    "clicked: Process",
+    "waiting for AI processing ~40s",
+    "candidate result images: 0"
+  ],
+  "result_img_srcs": []
+}
