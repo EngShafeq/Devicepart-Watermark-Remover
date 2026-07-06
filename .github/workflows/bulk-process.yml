@@ -1,0 +1,112 @@
+name: Bulk clean images (parallel)
+
+# Cleans a large batch of watermarked images by fanning the work out across
+# several GitHub runners (free for public repos), each running the pipeline
+# with multi-core --workers. Cleaned images are uploaded as downloadable
+# artifacts (NOT committed — thousands of images would bloat the repo).
+#
+# Feed it images one of two ways:
+#   1. Put files in the `input/` folder and commit them, OR
+#   2. Provide a `urls.txt` (one image URL per line) in the repo root — each
+#      shard downloads only its slice, so 100k images never touch git.
+
+on:
+  workflow_dispatch:
+    inputs:
+      shards:
+        description: "How many parallel runners to split the work across"
+        type: string
+        default: "8"
+      workers:
+        description: "CPU worker processes per runner"
+        type: string
+        default: "2"
+      inpaint:
+        description: "Final inpaint backend (mat/lama/none)"
+        type: choice
+        options: ["none", "mat", "lama"]
+        default: "none"
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.split.outputs.matrix }}
+      source: ${{ steps.split.outputs.source }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: claude/watermark-removal-tool-kzy7ka
+      - id: split
+        run: |
+          N=${{ github.event.inputs.shards }}; N=${N:-8}
+          if [ -f urls.txt ]; then
+            SRC=urls; COUNT=$(grep -c . urls.txt || echo 0)
+          else
+            shopt -s nullglob; imgs=(input/*.{jpg,jpeg,png,webp}); SRC=folder; COUNT=${#imgs[@]}
+          fi
+          echo "source=$SRC" >> "$GITHUB_OUTPUT"
+          # build a JSON array [0,1,...,N-1] as the shard matrix
+          idx=$(python3 -c "import json,sys; print(json.dumps(list(range(int(sys.argv[1])))))" "$N")
+          echo "matrix=$idx" >> "$GITHUB_OUTPUT"
+          echo "Planning $COUNT images from '$SRC' across $N shards."
+
+  process:
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: claude/watermark-removal-tool-kzy7ka
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          if [ "${{ github.event.inputs.inpaint }}" = "mat" ]; then pip install iopaint || true; fi
+          if [ "${{ github.event.inputs.inpaint }}" = "lama" ]; then pip install simple-lama-inpainting || true; fi
+      - name: Gather this shard's images
+        run: |
+          N=${{ github.event.inputs.shards }}; N=${N:-8}
+          S=${{ matrix.shard }}
+          mkdir -p shard_in shard_out
+          if [ "${{ needs.plan.outputs.source }}" = "urls" ]; then
+            # take every N-th URL starting at S, download into shard_in
+            awk "NR % $N == $S" urls.txt > my_urls.txt || true
+            i=0; while IFS= read -r u; do
+              [ -z "$u" ] && continue
+              ext="${u##*.}"; case "$ext" in jpg|jpeg|png|webp) ;; *) ext=jpg;; esac
+              curl -sSL "$u" -o "shard_in/img_${S}_${i}.${ext}" && i=$((i+1))
+            done < my_urls.txt
+            echo "downloaded $i images"
+          else
+            shopt -s nullglob; imgs=(input/*.{jpg,jpeg,png,webp})
+            i=0; for f in "${imgs[@]}"; do
+              if [ $(( i % N )) -eq $S ]; then cp "$f" shard_in/; fi; i=$((i+1))
+            done
+            echo "assigned $(ls shard_in | wc -l) images to shard $S"
+          fi
+      - name: Clean
+        run: |
+          if [ -z "$(ls shard_in 2>/dev/null)" ]; then echo "no images for this shard"; exit 0; fi
+          python -m watermark_remover remove \
+            --input-dir shard_in --output-dir shard_out \
+            --model models/deviceparts_1500.npz,models/deviceparts_1000_tilted.npz \
+            --net models/wmnet.pt \
+            --workers "${{ github.event.inputs.workers }}" \
+            --inpaint "${{ github.event.inputs.inpaint }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cleaned-shard-${{ matrix.shard }}
+          path: shard_out/
+          if-no-files-found: ignore
