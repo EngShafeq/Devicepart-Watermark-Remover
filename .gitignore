@@ -41,3 +41,7 @@ scratch_*/
 
 # external-site probe artifacts (committed by CI with -f)
 wm_test/
+
+# session deliverables (not repo content)
+deviceparts_training_images.zip
+scratch_new_session_prompt.md
