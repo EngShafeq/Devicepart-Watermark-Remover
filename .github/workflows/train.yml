@@ -1,0 +1,79 @@
+name: Train WMNet (unattended)
+
+# Runs the self-driving training loop on GitHub's runners, independent of any
+# chat session — so it keeps improving the model even while you're away.
+# Each job trains as many rounds as fit in a wall-clock budget (kept safely
+# under the 6-hour job cap), adopts a new model only when it beats the
+# incumbent on the held-out detail-preservation eval, and commits+pushes the
+# improvement to this branch.  If a CHAIN_PAT secret is present the job
+# re-dispatches itself at the end, so training continues job after job with
+# zero babysitting.  Without the secret it runs one job per manual trigger.
+
+on:
+  workflow_dispatch:
+    inputs:
+      budget_minutes:
+        description: "Wall-clock training budget for this job (< 330)"
+        type: string
+        default: "300"
+
+permissions:
+  contents: write
+  actions: write        # needed to re-dispatch (self-chain) when CHAIN_PAT is set
+
+concurrency:
+  group: train-wmnet     # never run two training jobs at once (they'd fight over the model)
+  cancel-in-progress: false
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: claude/watermark-removal-tool-kzy7ka
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Train
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          BUD_MIN="${{ github.event.inputs.budget_minutes }}"; BUD_MIN="${BUD_MIN:-300}"
+          export TIME_BUDGET_SEC=$(( BUD_MIN * 60 ))
+          export REPO_DIR="$PWD"
+          export BG="training/data/backgrounds"
+          export LOG="train_ci.log"
+          export EVAL_N=160
+          export PUSH_BRANCH="claude/watermark-removal-tool-kzy7ka"
+          bash training/train_loop.sh || true
+          echo "===== training log ====="; cat train_ci.log || true
+
+      - name: Re-dispatch to continue (only if CHAIN_PAT is set and not plateaued)
+        if: ${{ always() }}
+        env:
+          CHAIN_PAT: ${{ secrets.CHAIN_PAT }}
+        run: |
+          if [ -z "$CHAIN_PAT" ]; then
+            echo "No CHAIN_PAT secret -> single job. Re-run the workflow to train more."
+            exit 0
+          fi
+          if grep -q "PLATEAU" train_ci.log 2>/dev/null; then
+            echo "Plateaued -> not re-dispatching."
+            exit 0
+          fi
+          echo "Chaining another training job..."
+          curl -sS -X POST \
+            -H "Authorization: token $CHAIN_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/train.yml/dispatches" \
+            -d '{"ref":"claude/watermark-removal-tool-kzy7ka","inputs":{"budget_minutes":"300"}}'
