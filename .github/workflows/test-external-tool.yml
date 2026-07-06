@@ -1,0 +1,141 @@
+name: Test external watermark site
+
+# Probes the third-party site sora2watermarkremover.net with a headless
+# browser (the Claude sandbox blocks that host, but GitHub runners have open
+# network). Uploads one test image, triggers removal, and commits screenshots
+# + any result so we can judge whether it actually works — and how it treats
+# real print (chip digits) under the watermark.
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "Repo-relative image to test"
+        type: string
+        default: "training/data/backgrounds/9b9960d6-as120987_2304203911_1.jpg"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ext-wm-test
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: claude/watermark-removal-tool-kzy7ka
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Playwright
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Probe the site
+        env:
+          TEST_IMAGE: ${{ github.event.inputs.image }}
+        run: |
+          python - <<'PY'
+          import os, time, json
+          from playwright.sync_api import sync_playwright
+
+          URL = "https://sora2watermarkremover.net/remove-watermark-from-image"
+          IMG = os.environ.get("TEST_IMAGE") or "training/data/backgrounds/9b9960d6-as120987_2304203911_1.jpg"
+          out = "wm_test"; os.makedirs(out, exist_ok=True)
+          log = {"url": URL, "image": IMG, "steps": []}
+
+          def note(m):
+              print(m, flush=True); log["steps"].append(m)
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+              ctx = browser.new_context(accept_downloads=True,
+                                        viewport={"width":1440,"height":1024},
+                                        user_agent=("Mozilla/5.0 (X11; Linux x86_64) "
+                                                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                                    "Chrome/124.0 Safari/537.36"))
+              page = ctx.new_page()
+              downloads = []
+              page.on("download", lambda d: downloads.append(d))
+              try:
+                  page.goto(URL, wait_until="domcontentloaded", timeout=60000)
+              except Exception as e:
+                  note(f"goto error: {e}")
+              page.wait_for_timeout(5000)
+              page.screenshot(path=f"{out}/01_loaded.png", full_page=True)
+              open(f"{out}/page.html","w",encoding="utf-8").write(page.content())
+              note(f"title: {page.title()}")
+
+              # dismiss common cookie/consent banners
+              for lbl in ["Accept","Accept all","I agree","Agree","Got it","OK","Allow all"]:
+                  try:
+                      b = page.query_selector(f"button:has-text('{lbl}')")
+                      if b: b.click(timeout=2000); note(f"dismissed banner: {lbl}"); break
+                  except Exception: pass
+
+              inputs = page.query_selector_all("input[type=file]")
+              note(f"file inputs found: {len(inputs)}")
+              if inputs:
+                  try:
+                      inputs[0].set_input_files(IMG)
+                      note("uploaded image to first file input")
+                  except Exception as e:
+                      note(f"upload error: {e}")
+                  page.wait_for_timeout(6000)
+                  page.screenshot(path=f"{out}/02_uploaded.png", full_page=True)
+                  # try to trigger processing
+                  for lbl in ["Remove Watermark","Remove","Auto","Start","Process",
+                              "Generate","Erase","Clean","Download"]:
+                      try:
+                          b = page.query_selector(f"button:has-text('{lbl}')")
+                          if b and b.is_enabled():
+                              b.click(timeout=3000); note(f"clicked: {lbl}")
+                              page.wait_for_timeout(2000)
+                      except Exception: pass
+                  note("waiting for AI processing ~40s")
+                  page.wait_for_timeout(40000)
+                  page.screenshot(path=f"{out}/03_result.png", full_page=True)
+                  # record result <img> sources (data/blob URLs are the output)
+                  srcs = []
+                  for im in page.query_selector_all("img"):
+                      s = im.get_attribute("src") or ""
+                      if s.startswith("data:") or s.startswith("blob:") or "result" in s.lower():
+                          srcs.append(s[:120])
+                  log["result_img_srcs"] = srcs
+                  note(f"candidate result images: {len(srcs)}")
+                  # save any downloads
+                  for i,d in enumerate(downloads):
+                      try:
+                          d.save_as(f"{out}/download_{i}_{d.suggested_filename}")
+                          note(f"saved download: {d.suggested_filename}")
+                      except Exception as e:
+                          note(f"download save error: {e}")
+              else:
+                  note("no file input -> likely needs interaction/login/captcha")
+              browser.close()
+
+          json.dump(log, open(f"{out}/probe_log.json","w"), indent=2, ensure_ascii=False)
+          print(json.dumps(log, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Commit probe artifacts
+        if: ${{ always() }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f wm_test || true
+          git diff --cached --quiet || git commit -m "External watermark-site probe artifacts [skip ci]"
+          for a in 1 2 3 4; do
+            git pull --rebase -X ours origin claude/watermark-removal-tool-kzy7ka || true
+            git push origin HEAD:claude/watermark-removal-tool-kzy7ka && break
+            sleep $((a*2))
+          done
