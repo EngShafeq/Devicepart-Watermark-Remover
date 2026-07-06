@@ -241,6 +241,42 @@ def register_model(image_rgb: np.ndarray, model: "WatermarkModel",
                           image_rgb.shape[:2])
 
 
+def model_fit_score(image_rgb: np.ndarray, model: "WatermarkModel",
+                    scales=(0.85, 1.0, 1.15, 1.3, 1.45)) -> float:
+    """How well this watermark model explains this image (0..1).
+
+    Correlates the model's alpha matte against the image's local "ink"
+    (deviation from a median background) near the expected footprint.  A
+    high peak means the watermark really is present in that shape/place —
+    so when several models share an aspect ratio (e.g. the straight 1500
+    export vs the tilted product-photo export), we can pick the one that
+    actually matches this image instead of guessing by size."""
+    work = model.rescaled(image_rgb.shape[:2]) \
+        if image_rgb.shape[:2] != model.image_shape else model
+    x, y, w, h = work.bbox
+    H, W = image_rgb.shape[:2]
+    gray = image_rgb.astype(np.float32).mean(axis=2)
+    g_u8 = np.clip(gray, 0, 255).astype(np.uint8)
+    ink = np.zeros_like(gray)
+    for k in (51, 101):
+        bg = cv2.medianBlur(g_u8, k).astype(np.float32)
+        ink = np.maximum(ink, np.abs(gray - bg))
+    pad = 60
+    x0, y0 = max(0, x - pad), max(0, y - pad)
+    x1, y1 = min(W, x + w + pad), min(H, y + h + pad)
+    window = ink[y0:y1, x0:x1]
+    best = 0.0
+    for s in scales:
+        tw, th = int(round(w * s)), int(round(h * s))
+        if th < 8 or tw < 8 or th >= window.shape[0] or tw >= window.shape[1]:
+            continue
+        tpl = cv2.resize(work.alpha, (tw, th), interpolation=cv2.INTER_AREA)
+        res = cv2.matchTemplate(window.astype(np.float32), tpl.astype(np.float32),
+                                cv2.TM_CCOEFF_NORMED)
+        best = max(best, float(cv2.minMaxLoc(res)[1]))
+    return best
+
+
 def mask_from_flat_template(template_rgb: np.ndarray, ink_thresh: float = 2.5,
                             dilate_px: int = 3) -> np.ndarray:
     """Watermark footprint from a logo file flattened on white: ink is any

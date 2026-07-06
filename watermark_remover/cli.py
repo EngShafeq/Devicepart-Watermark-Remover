@@ -76,16 +76,27 @@ def cmd_remove(args: argparse.Namespace) -> None:
     if args.bbox:
         fixed_bbox = tuple(int(v) for v in args.bbox.split(","))
 
-    def _pick_model(shape):
-        """Native-size match wins; otherwise the first model with the same
-        aspect ratio (its matte is rescaled + registered per image)."""
+    def _pick_model(shape, image_rgb=None):
+        """Choose the watermark model for this image.
+
+        A native-size match is trusted directly.  Otherwise — the tricky
+        case where several models share a 1:1 aspect ratio (the straight
+        1500 export vs the tilted product-photo export) — we measure how
+        well each aspect-compatible model's matte actually correlates with
+        *this* image and pick the best fit, instead of blindly taking the
+        first-listed one (which mis-removed tilted-watermark photos)."""
         for m in models:
             if shape == m.image_shape:
                 return m
-        for m in models:
-            if abs(shape[1] / shape[0] - m.image_shape[1] / m.image_shape[0]) < 0.01:
-                return m
-        return None
+        cands = [m for m in models
+                 if abs(shape[1] / shape[0] - m.image_shape[1] / m.image_shape[0]) < 0.01]
+        if not cands:
+            return None
+        if len(cands) == 1 or image_rgb is None:
+            return cands[0]
+        scored = [(estimate.model_fit_score(image_rgb, m), m) for m in cands]
+        scored.sort(key=lambda t: t[0], reverse=True)
+        return scored[0][1]
 
     net = None
     if args.net:
@@ -96,7 +107,7 @@ def cmd_remove(args: argparse.Namespace) -> None:
     for item in batch:
         name = os.path.basename(item.path)
         try:
-            model = _pick_model(item.rgb.shape[:2])
+            model = _pick_model(item.rgb.shape[:2], item.rgb)
             # Cleanup inpaints leftovers; on text-dense products (labels,
             # chip prints) it can eat real print, so it only runs for the
             # primary (first-listed) variant.
@@ -110,6 +121,7 @@ def cmd_remove(args: argparse.Namespace) -> None:
                     out = remove.cleanup_residual(out, reg)
                 out = remove.suppress_chroma_residual(out, reg)
                 out = remove.flatten_lowfreq_residual(out, reg)
+                out = remove.despeckle_residual(out, reg)
                 out = _apply_inpaint(out, reg, args)
                 how = "neural"
             elif model is not None:
@@ -118,6 +130,7 @@ def cmd_remove(args: argparse.Namespace) -> None:
                     out = remove.cleanup_residual(out, model)
                 out = remove.suppress_chroma_residual(out, model)
                 out = remove.flatten_lowfreq_residual(out, model)
+                out = remove.despeckle_residual(out, model)
                 out = _apply_inpaint(out, model, args)
                 how = "unblend"
             else:

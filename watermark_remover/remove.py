@@ -274,6 +274,44 @@ def flatten_lowfreq_residual(image_rgb: np.ndarray, model: WatermarkModel,
     return out
 
 
+def despeckle_residual(image_rgb: np.ndarray, model: WatermarkModel,
+                       thresh: float = 26.0, max_area: int = 22) -> np.ndarray:
+    """Remove the small dark/bright specks the unblend leaves on dark,
+    textured surfaces (IC bodies, black trays) where the watermark core was
+    strongest.
+
+    A speck is an isolated cluster of pixels that deviates sharply from its
+    local median *and* is tiny — genuine print forms long connected strokes,
+    so an area cap protects it.  Each speck is filled from the local median,
+    confined to the watermark footprint so clean pixels are never touched."""
+    if image_rgb.shape[:2] != model.image_shape:
+        model = model.rescaled(image_rgb.shape[:2])
+    x, y, w, h = model.bbox
+    foot = model.alpha > 0.06
+    if not foot.any():
+        return image_rgb
+    crop = np.clip(image_rgb[y:y + h, x:x + w], 0, 255).astype(np.float32)
+    med = cv2.medianBlur(crop.astype(np.uint8), 5).astype(np.float32)
+    dev = np.abs(crop - med).max(axis=2)                  # per-pixel anomaly
+    anom = ((dev > thresh) & foot).astype(np.uint8)
+    if anom.sum() == 0:
+        return image_rgb
+    # keep only *small* anomalies (specks); large connected regions are real
+    n, lbl, stats, _ = cv2.connectedComponentsWithStats(anom, 8)
+    speck = np.zeros_like(anom)
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] <= max_area:
+            speck[lbl == i] = 1
+    if speck.sum() == 0:
+        return image_rgb
+    speck = cv2.dilate(speck, np.ones((3, 3), np.uint8))
+    soft = cv2.GaussianBlur(speck.astype(np.float32), (0, 0), 1.0)[..., None]
+    fixed = crop * (1 - soft) + med * soft
+    out = image_rgb.astype(np.float32).copy()
+    out[y:y + h, x:x + w] = np.clip(fixed, 0, 255)
+    return out
+
+
 def region_metrics(a: np.ndarray, b: np.ndarray, bbox: tuple[int, int, int, int]) -> dict:
     """PSNR / SSIM restricted to the watermark bounding box — the honest
     measure of removal quality."""

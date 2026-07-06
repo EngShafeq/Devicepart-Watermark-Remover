@@ -94,6 +94,9 @@ $cj
 Co-Authored-By: Claude <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01Exj22XxGEXRzMKUnMTu4SE" >> "$LOG" 2>&1
       for attempt in 1 2 3 4; do
+        # Rebase onto any concurrent commits (e.g. pipeline fixes pushed from
+        # a chat session) so the model update never fails on non-fast-forward.
+        git pull --rebase -X ours origin "$PUSH_BRANCH" >> "$LOG" 2>&1 || true
         git push origin "HEAD:$PUSH_BRANCH" >> "$LOG" 2>&1 && break
         sleep $((attempt * 2))
       done
