@@ -38,3 +38,6 @@ models/*.bak
 
 # transient scratch output (session working files)
 scratch_*/
+
+# external-site probe artifacts (committed by CI with -f)
+wm_test/

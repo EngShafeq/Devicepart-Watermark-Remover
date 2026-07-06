@@ -101,16 +101,39 @@ jobs:
                               b.click(timeout=3000); note(f"clicked: {lbl}")
                               page.wait_for_timeout(2000)
                       except Exception: pass
-                  note("waiting for AI processing ~40s")
-                  page.wait_for_timeout(40000)
-                  page.screenshot(path=f"{out}/03_result.png", full_page=True)
-                  # record result <img> sources (data/blob URLs are the output)
+                  note("polling up to 150s for a result OR a paywall/login prompt")
+                  outcome = "timeout"
                   srcs = []
-                  for im in page.query_selector_all("img"):
-                      s = im.get_attribute("src") or ""
-                      if s.startswith("data:") or s.startswith("blob:") or "result" in s.lower():
-                          srcs.append(s[:120])
-                  log["result_img_srcs"] = srcs
+                  for t in range(30):            # 30 x 5s = 150s
+                      page.wait_for_timeout(5000)
+                      body = (page.inner_text("body") or "").lower()
+                      if any(k in body for k in ["insufficient credit","not enough",
+                              "sign in to continue","out of","run out","upgrade","view pricing"]):
+                          outcome = "paywall/login required"; break
+                      srcs = []
+                      for im in page.query_selector_all("img"):
+                          s = im.get_attribute("src") or ""
+                          if s.startswith("data:") or s.startswith("blob:"):
+                              srcs.append(s)
+                      dl = page.query_selector("a[download], button:has-text('Download')")
+                      if srcs or dl:
+                          outcome = "result produced"; break
+                  log["outcome"] = outcome
+                  note(f"outcome: {outcome}")
+                  page.screenshot(path=f"{out}/03_result.png", full_page=True)
+                  # crop the working area (top card) for a close look
+                  try:
+                      page.screenshot(path=f"{out}/03b_workarea.png",
+                                      clip={"x":0,"y":0,"width":1440,"height":700})
+                  except Exception: pass
+                  # save any data/blob result image to a file
+                  for i,s in enumerate(srcs[:4]):
+                      if s.startswith("data:image"):
+                          import base64
+                          b64 = s.split(",",1)[1]
+                          open(f"{out}/result_{i}.png","wb").write(base64.b64decode(b64))
+                          note(f"saved result_{i}.png")
+                  log["result_img_srcs"] = [s[:80] for s in srcs]
                   note(f"candidate result images: {len(srcs)}")
                   # save any downloads
                   for i,d in enumerate(downloads):
