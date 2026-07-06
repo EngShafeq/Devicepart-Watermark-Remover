@@ -92,17 +92,71 @@ class PairMaker:
             patch = cv2.warpAffine(patch, M, (PATCH, PATCH), borderMode=cv2.BORDER_REFLECT)
         return np.clip(patch, 0, 255)
 
+    def _structure_patch(self) -> np.ndarray:
+        """Synthetic *generic* structure under the watermark — circles, rings,
+        rectangles/slots, lines, arrows, grids and traces.
+
+        The goal is not text: it is to teach the refiner to reconstruct
+        WHATEVER detail sits behind the mark (camera-lens rings, SIM-tray
+        slots, flex-cable traces/arrows, PCB components, connector edges).
+        Text is only one narrow member of this family, so we synthesize the
+        whole family and keep the objective general."""
+        r = self.rng
+        base = r.uniform(10, 240)
+        tint = r.uniform(-6, 6, 3)
+        canvas = np.clip(np.full((PATCH, PATCH, 3), base) + tint, 0, 255).astype(np.uint8)
+        # contrasting "ink" for the drawn structures
+        fg = base + (r.uniform(60, 170) * (1 if base < 128 else -1))
+        col = tuple(int(np.clip(fg + r.uniform(-15, 15), 0, 255)) for _ in range(3))
+        kind = r.random()
+        C = PATCH // 2
+        if kind < 0.30:                       # concentric rings / circles (lenses)
+            for _ in range(int(r.integers(1, 4))):
+                cx = int(r.integers(PATCH // 4, 3 * PATCH // 4))
+                cy = int(r.integers(PATCH // 4, 3 * PATCH // 4))
+                for rad in range(int(r.integers(20, 40)), PATCH // 2, int(r.integers(14, 30))):
+                    cv2.circle(canvas, (cx, cy), rad, col, int(r.integers(1, 4)), cv2.LINE_AA)
+        elif kind < 0.55:                     # rectangles / slots (trays, connectors)
+            for _ in range(int(r.integers(2, 6))):
+                x1 = int(r.integers(0, PATCH - 20)); y1 = int(r.integers(0, PATCH - 20))
+                x2 = min(PATCH - 1, x1 + int(r.integers(20, 120)))
+                y2 = min(PATCH - 1, y1 + int(r.integers(12, 90)))
+                cv2.rectangle(canvas, (x1, y1), (x2, y2), col, int(r.integers(1, 4)), cv2.LINE_AA)
+        elif kind < 0.75:                     # parallel traces / lines (flex, ribbon)
+            horiz = r.random() < 0.5
+            step = int(r.integers(8, 22))
+            for p in range(0, PATCH, step):
+                if horiz:
+                    cv2.line(canvas, (0, p), (PATCH, p + int(r.uniform(-8, 8))), col,
+                             int(r.integers(1, 3)), cv2.LINE_AA)
+                else:
+                    cv2.line(canvas, (p, 0), (p + int(r.uniform(-8, 8)), PATCH), col,
+                             int(r.integers(1, 3)), cv2.LINE_AA)
+        else:                                 # scattered small components (PCB) + a grid
+            for _ in range(int(r.integers(8, 30))):
+                x1 = int(r.integers(0, PATCH)); y1 = int(r.integers(0, PATCH))
+                cv2.rectangle(canvas, (x1, y1),
+                              (x1 + int(r.integers(3, 14)), y1 + int(r.integers(3, 14))),
+                              col, -1)
+        if r.random() < 0.4:                  # random rotation
+            angle = r.uniform(-25, 25)
+            M = cv2.getRotationMatrix2D((C, C), angle, 1.0)
+            canvas = cv2.warpAffine(canvas, M, (PATCH, PATCH), borderMode=cv2.BORDER_REFLECT)
+        return canvas.astype(np.float32)
+
     def _bg_patch(self) -> np.ndarray:
         r = self.rng
         kind = r.random()
-        if kind < 0.45:  # real photo crop
+        if kind < 0.55:  # real product-photo crop — the diverse "whatever is behind"
             img = self.bgs[int(r.integers(len(self.bgs)))]
             y = int(r.integers(0, img.shape[0] - PATCH))
             x = int(r.integers(0, img.shape[1] - PATCH))
             return img[y:y + PATCH, x:x + PATCH].copy()
-        if kind < 0.70:  # chip/label print — teaches text reconstruction
+        if kind < 0.75:  # generic structures (rings, slots, traces, components)
+            return self._structure_patch()
+        if kind < 0.85:  # chip/label print — one narrow case, not the focus
             return self._text_patch()
-        if kind < 0.88:  # flat tone (screens, paper) + slight gradient + noise
+        if kind < 0.93:  # flat tone (screens, paper) + slight gradient + noise
             base = r.uniform(5, 250)
             g = np.linspace(0, r.uniform(-12, 12), PATCH, dtype=np.float32)
             patch = np.full((PATCH, PATCH, 3), base, np.float32)
