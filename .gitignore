@@ -35,3 +35,6 @@ scratch_lama_out/
 models/wmnet_deep.pt
 models/candidates/
 models/*.bak
+
+# transient scratch output (session working files)
+scratch_*/
