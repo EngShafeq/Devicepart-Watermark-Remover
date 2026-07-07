@@ -56,7 +56,7 @@ jobs:
           export EVAL_N=160
           export PUSH_BRANCH="claude/watermark-removal-tool-kzy7ka"
           bash training/train_loop.sh || true
-          echo "===== training log ====="; cat train_ci.log || true
+          echo "===== training log (tail) ====="; tail -60 train_ci.log || true
 
       - name: Re-dispatch to continue (only if CHAIN_PAT is set and not plateaued)
         if: ${{ always() }}
