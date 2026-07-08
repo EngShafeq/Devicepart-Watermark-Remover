@@ -1,0 +1,47 @@
+__pycache__/
+*.pyc
+output*/
+samples/*.jpeg
+samples/*.png
+.pytest_cache/
+samples/*.npz
+verify_out/
+samples_v2/
+all_samples/
+train_bgs/
+final_all/
+final_v*/
+output_chroma/
+output_tilted*/
+samples_v3/
+out_v*/
+fit3/
+vr*/
+RESULTS/
+FINAL/
+train_day.log
+TEST_DAY/
+T2/
+T3/
+REG/
+REG2/
+REG3/
+REG4/
+fit_tilted_all/
+REG5/
+fit1500_all/
+REG6/
+scratch_lama_out/
+models/wmnet_deep.pt
+models/candidates/
+models/*.bak
+
+# transient scratch output (session working files)
+scratch_*/
+
+# external-site probe artifacts (committed by CI with -f)
+wm_test/
+
+# session deliverables (not repo content)
+deviceparts_training_images.zip
+scratch_new_session_prompt.md

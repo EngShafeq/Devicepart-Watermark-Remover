@@ -1,0 +1,345 @@
+"""Train WMNet to remove the learned Device Parts watermark.
+
+Training pairs are synthesized on the fly:
+  background  = random crop from real (cleaned) product photos, plus
+                procedural flats/gradients that mimic screens and paper
+  watermarked = alpha-composite of the learned watermark at random
+                scale/opacity, followed by a JPEG round-trip
+The network sees (watermarked RGB, matte) and regresses the residual.
+
+Usage:
+  python training/train_wmnet.py --model models/deviceparts_1500.npz \
+      --backgrounds output9/ --out models/wmnet.pt --steps 1200
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import os
+import sys
+import time
+
+import cv2
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from watermark_remover import estimate  # noqa: E402
+from watermark_remover.neural import WMNet  # noqa: E402
+
+PATCH = 192
+
+
+class PairMaker:
+    def __init__(self, models, bg_dir: str, seed: int = 0):
+        if not isinstance(models, (list, tuple)):
+            models = [models]
+        self.rng = np.random.default_rng(seed)
+        self.variants = []
+        for model in models:
+            a = np.maximum(model.alpha, 0.08)[..., None]
+            Wf = model.alpha_w / a
+            strong = model.alpha > 0.25
+            med = np.median(model.alpha_w[strong] / a[strong[..., None]].reshape(-1, 1),
+                            axis=0) if strong.any() else np.array([170, 170, 170])
+            Wf[~strong] = med
+            self.variants.append((model.alpha, np.clip(Wf, 0, 255).astype(np.float32)))
+        self.bgs = []
+        for p in sorted(glob.glob(os.path.join(bg_dir, "*"))):
+            img = cv2.imread(p, cv2.IMREAD_COLOR)
+            if img is not None and min(img.shape[:2]) >= PATCH:
+                self.bgs.append(cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32))
+        if not self.bgs:
+            raise SystemExit(f"no backgrounds found in {bg_dir}")
+
+    def _text_patch(self) -> np.ndarray:
+        """Synthetic chip/label print: rows of characters on a substrate.
+
+        This is the class the refiner previously never saw — so it learned
+        to flatten the watermark footprint without any prior that *print*
+        lives there.  Training on it teaches the network to reconstruct
+        strokes under the mark instead of smearing them, which is exactly
+        where the visible text loss came from."""
+        r = self.rng
+        dark_chip = r.random() < 0.6
+        if dark_chip:                              # black IC body, light print
+            base = r.uniform(8, 55)
+            ink = r.uniform(150, 235)
+        else:                                      # light label, dark print
+            base = r.uniform(200, 250)
+            ink = r.uniform(10, 70)
+        tint = r.uniform(-5, 5, 3)
+        # cv2.putText needs a uint8 canvas (OpenCV 5); render then float-cast
+        canvas = np.clip(np.full((PATCH, PATCH, 3), base) + tint, 0, 255).astype(np.uint8)
+        chars = "ABCDEFGHJKLMNPQRSTUVWXYZ0123456789-"
+        n_rows = int(r.integers(2, 6))
+        scale = float(r.uniform(0.5, 1.4))
+        thick = int(r.integers(1, 3))
+        col = (int(ink), int(ink), int(ink))
+        for i in range(n_rows):
+            py = int((i + 0.7) * PATCH / (n_rows + 1))
+            px = int(r.integers(4, PATCH // 3))
+            s = "".join(chars[int(r.integers(len(chars)))]
+                        for _ in range(int(r.integers(4, 11))))
+            cv2.putText(canvas, s, (px, py), cv2.FONT_HERSHEY_SIMPLEX,
+                        scale, col, thick, cv2.LINE_AA)
+        patch = canvas.astype(np.float32)
+        if r.random() < 0.5:                       # slight rotation like real chips
+            angle = r.uniform(-8, 8)
+            M = cv2.getRotationMatrix2D((PATCH / 2, PATCH / 2), angle, 1.0)
+            patch = cv2.warpAffine(patch, M, (PATCH, PATCH), borderMode=cv2.BORDER_REFLECT)
+        return np.clip(patch, 0, 255)
+
+    def _structure_patch(self) -> np.ndarray:
+        """Synthetic *generic* structure under the watermark — circles, rings,
+        rectangles/slots, lines, arrows, grids and traces.
+
+        The goal is not text: it is to teach the refiner to reconstruct
+        WHATEVER detail sits behind the mark (camera-lens rings, SIM-tray
+        slots, flex-cable traces/arrows, PCB components, connector edges).
+        Text is only one narrow member of this family, so we synthesize the
+        whole family and keep the objective general."""
+        r = self.rng
+        base = r.uniform(10, 240)
+        tint = r.uniform(-6, 6, 3)
+        canvas = np.clip(np.full((PATCH, PATCH, 3), base) + tint, 0, 255).astype(np.uint8)
+        # contrasting "ink" for the drawn structures
+        fg = base + (r.uniform(60, 170) * (1 if base < 128 else -1))
+        col = tuple(int(np.clip(fg + r.uniform(-15, 15), 0, 255)) for _ in range(3))
+        kind = r.random()
+        C = PATCH // 2
+        if kind < 0.30:                       # concentric rings / circles (lenses)
+            for _ in range(int(r.integers(1, 4))):
+                cx = int(r.integers(PATCH // 4, 3 * PATCH // 4))
+                cy = int(r.integers(PATCH // 4, 3 * PATCH // 4))
+                for rad in range(int(r.integers(20, 40)), PATCH // 2, int(r.integers(14, 30))):
+                    cv2.circle(canvas, (cx, cy), rad, col, int(r.integers(1, 4)), cv2.LINE_AA)
+        elif kind < 0.55:                     # rectangles / slots (trays, connectors)
+            for _ in range(int(r.integers(2, 6))):
+                x1 = int(r.integers(0, PATCH - 20)); y1 = int(r.integers(0, PATCH - 20))
+                x2 = min(PATCH - 1, x1 + int(r.integers(20, 120)))
+                y2 = min(PATCH - 1, y1 + int(r.integers(12, 90)))
+                cv2.rectangle(canvas, (x1, y1), (x2, y2), col, int(r.integers(1, 4)), cv2.LINE_AA)
+        elif kind < 0.75:                     # parallel traces / lines (flex, ribbon)
+            horiz = r.random() < 0.5
+            step = int(r.integers(8, 22))
+            for p in range(0, PATCH, step):
+                if horiz:
+                    cv2.line(canvas, (0, p), (PATCH, p + int(r.uniform(-8, 8))), col,
+                             int(r.integers(1, 3)), cv2.LINE_AA)
+                else:
+                    cv2.line(canvas, (p, 0), (p + int(r.uniform(-8, 8)), PATCH), col,
+                             int(r.integers(1, 3)), cv2.LINE_AA)
+        else:                                 # scattered small components (PCB) + a grid
+            for _ in range(int(r.integers(8, 30))):
+                x1 = int(r.integers(0, PATCH)); y1 = int(r.integers(0, PATCH))
+                cv2.rectangle(canvas, (x1, y1),
+                              (x1 + int(r.integers(3, 14)), y1 + int(r.integers(3, 14))),
+                              col, -1)
+        if r.random() < 0.4:                  # random rotation
+            angle = r.uniform(-25, 25)
+            M = cv2.getRotationMatrix2D((C, C), angle, 1.0)
+            canvas = cv2.warpAffine(canvas, M, (PATCH, PATCH), borderMode=cv2.BORDER_REFLECT)
+        return canvas.astype(np.float32)
+
+    def _bg_patch(self) -> np.ndarray:
+        r = self.rng
+        kind = r.random()
+        if kind < 0.55:  # real product-photo crop — the diverse "whatever is behind"
+            img = self.bgs[int(r.integers(len(self.bgs)))]
+            y = int(r.integers(0, img.shape[0] - PATCH))
+            x = int(r.integers(0, img.shape[1] - PATCH))
+            return img[y:y + PATCH, x:x + PATCH].copy()
+        if kind < 0.75:  # generic structures (rings, slots, traces, components)
+            return self._structure_patch()
+        if kind < 0.85:  # chip/label print — one narrow case, not the focus
+            return self._text_patch()
+        if kind < 0.93:  # flat tone (screens, paper) + slight gradient + noise
+            base = r.uniform(5, 250)
+            g = np.linspace(0, r.uniform(-12, 12), PATCH, dtype=np.float32)
+            patch = np.full((PATCH, PATCH, 3), base, np.float32)
+            patch += g[None, :, None] if r.random() < 0.5 else g[:, None, None]
+            tint = r.uniform(-6, 6, 3).astype(np.float32)
+            return np.clip(patch + tint, 0, 255)
+        # two-tone edge (product boundary crossing the watermark)
+        a, b = r.uniform(5, 250, 2)
+        patch = np.full((PATCH, PATCH, 3), a, np.float32)
+        pos = int(r.integers(PATCH // 4, 3 * PATCH // 4))
+        if r.random() < 0.5:
+            patch[:, pos:] = b
+        else:
+            patch[pos:, :] = b
+        angle = r.uniform(-30, 30)
+        M = cv2.getRotationMatrix2D((PATCH / 2, PATCH / 2), angle, 1.0)
+        return cv2.warpAffine(patch, M, (PATCH, PATCH), borderMode=cv2.BORDER_REFLECT)
+
+    def sample(self):
+        r = self.rng
+        B = self._bg_patch()
+        B += r.normal(0, r.uniform(0.5, 2.0), B.shape).astype(np.float32)
+        B = np.clip(B, 0, 255)
+
+        # random variant + window of the watermark at random scale/opacity
+        v_alpha, v_W = self.variants[int(r.integers(len(self.variants)))]
+        scale = r.uniform(0.55, 1.15)
+        op = r.uniform(0.75, 1.25)
+        ah, aw_ = v_alpha.shape
+        th, tw = int(ah * scale), int(aw_ * scale)
+        a_s = cv2.resize(v_alpha, (tw, th), interpolation=cv2.INTER_AREA)
+        W_s = cv2.resize(v_W, (tw, th), interpolation=cv2.INTER_AREA)
+        # pick a window that actually contains ink most of the time
+        for _ in range(8):
+            wy = int(r.integers(0, max(th - PATCH, 1)))
+            wx = int(r.integers(0, max(tw - PATCH, 1)))
+            a_win = a_s[wy:wy + PATCH, wx:wx + PATCH]
+            if a_win.mean() > 0.005 or r.random() < 0.15:
+                break
+        a_win = a_win[:PATCH, :PATCH]
+        W_win = W_s[wy:wy + PATCH, wx:wx + PATCH][:PATCH, :PATCH]
+        ph, pw = a_win.shape
+        if ph < PATCH or pw < PATCH:
+            a_win = np.pad(a_win, ((0, PATCH - ph), (0, PATCH - pw)))
+            W_win = np.pad(W_win, ((0, PATCH - ph), (0, PATCH - pw), (0, 0)))
+
+        a_eff = np.clip(a_win * op, 0, 0.98)[..., None]
+        I = a_eff * W_win + (1 - a_eff) * B
+
+        # JPEG round-trip like the site's exports
+        q = int(self.rng.integers(78, 97))
+        ok, buf = cv2.imencode(".jpg", cv2.cvtColor(I.astype(np.uint8), cv2.COLOR_RGB2BGR),
+                               [cv2.IMWRITE_JPEG_QUALITY, q])
+        I = cv2.cvtColor(cv2.imdecode(buf, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB).astype(np.float32)
+
+        # Analytic unblend with the *assumed* model (op=1, tiny misalignment)
+        # -- reproduces the residue patterns the refiner must repair.
+        dx, dy = (int(self.rng.integers(-2, 3)), int(self.rng.integers(-2, 3))) \
+            if self.rng.random() < 0.5 else (0, 0)
+        M = np.float32([[1, 0, dx], [0, 1, dy]])
+        a_asm = cv2.warpAffine(a_win, M, (PATCH, PATCH))[..., None]
+        W_asm = cv2.warpAffine(W_win, M, (PATCH, PATCH))
+        U = (I - a_asm * W_asm) / np.maximum(1 - a_asm, 0.02)
+        U = np.clip(U, 0, 255)
+
+        inp = np.concatenate([U / 255.0, a_asm], axis=2)
+        tgt = (U - B) / 255.0  # residual the refiner must remove
+        return inp.transpose(2, 0, 1), tgt.transpose(2, 0, 1), a_win
+
+    def batch(self, n):
+        xs, ys, ms = zip(*(self.sample() for _ in range(n)))
+        return (torch.from_numpy(np.stack(xs)).float(),
+                torch.from_numpy(np.stack(ys)).float(),
+                torch.from_numpy(np.stack(ms)).float())
+
+
+_SOBEL_X = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]]).view(1, 1, 3, 3)
+_SOBEL_Y = _SOBEL_X.transpose(2, 3)
+
+
+def _grad_loss(pred, tgt):
+    """L1 on Sobel gradients — penalises edge/text errors specifically, so
+    the refiner keeps chip prints and label strokes crisp instead of
+    smearing them."""
+    c = pred.shape[1]
+    kx = _SOBEL_X.repeat(c, 1, 1, 1).to(pred.device)
+    ky = _SOBEL_Y.repeat(c, 1, 1, 1).to(pred.device)
+    gpx = F.conv2d(pred, kx, padding=1, groups=c)
+    gpy = F.conv2d(pred, ky, padding=1, groups=c)
+    gtx = F.conv2d(tgt, kx, padding=1, groups=c)
+    gty = F.conv2d(tgt, ky, padding=1, groups=c)
+    return (gpx - gtx).abs().mean() + (gpy - gty).abs().mean()
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", required=True)
+    ap.add_argument("--backgrounds", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--steps", type=int, default=1200)
+    ap.add_argument("--batch", type=int, default=6)
+    ap.add_argument("--lr", type=float, default=2e-3)
+    ap.add_argument("--base", type=int, default=24)
+    ap.add_argument("--depth", type=int, default=3)
+    ap.add_argument("--grad-weight", type=float, default=0.5)
+    ap.add_argument("--seed", type=int, default=0,
+                    help="varies weight init + synthetic data across rounds")
+    ap.add_argument("--init", default=None,
+                    help="warm-start weights from this checkpoint (arch must "
+                         "match); defaults to --out if it exists")
+    args = ap.parse_args()
+
+    torch.manual_seed(args.seed)
+    models = [estimate.WatermarkModel.load(p) for p in args.model.split(",")]
+    maker = PairMaker(models, args.backgrounds, seed=args.seed)
+    # held-out val uses a reserved seed disjoint from every training round
+    val_x, val_y, val_m = PairMaker(models, args.backgrounds, seed=90000).batch(16)
+
+    net = WMNet(base=args.base, depth=args.depth)
+    warm = args.init if args.init else args.out
+    if warm and os.path.exists(warm):  # warm start only if the arch matches
+        try:
+            net.load_state_dict(torch.load(warm, map_location="cpu",
+                                           weights_only=True))
+            print(f"warm start from {warm}")
+        except Exception:
+            print("checkpoint arch mismatch; training the new arch from scratch")
+    print(f"params: {sum(p.numel() for p in net.parameters())/1e3:.0f}k "
+          f"(base={args.base} depth={args.depth})")
+    opt = torch.optim.Adam(net.parameters(), lr=args.lr)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.steps)
+
+    t0 = time.time()
+    # Seed `best` with the warm-started model's score so a resumed run never
+    # overwrites a good checkpoint with an under-converged one.
+    with torch.no_grad():
+        vp0 = net(val_x)
+        cp0 = val_x[:, :3] - vp0
+        ct0 = val_x[:, :3] - val_y
+        best = ((cp0 - ct0) ** 2).mean().item() \
+            + args.grad_weight * _grad_loss(cp0, ct0).item()
+    ema_net = None
+    ema_decay = 0.997
+    for step in range(1, args.steps + 1):
+        x, ytgt, m = maker.batch(args.batch)
+        pred = net(x)
+        # weight loss toward watermark pixels but keep global fidelity
+        wmap = 1.0 + 9.0 * m[:, None]
+        clean_pred = x[:, :3] - pred
+        clean_true = x[:, :3] - ytgt
+        loss = (wmap * (pred - ytgt).abs()).mean() \
+            + args.grad_weight * _grad_loss(clean_pred, clean_true)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        sched.step()
+        # EMA of weights — the smoothed model generalises better and is what
+        # we evaluate/save (a standard best-practice for final quality).
+        with torch.no_grad():
+            if ema_net is None:
+                ema_net = WMNet(base=args.base, depth=args.depth)
+                ema_net.load_state_dict(net.state_dict())
+            for pe, pn in zip(ema_net.parameters(), net.parameters()):
+                pe.mul_(ema_decay).add_(pn, alpha=1 - ema_decay)
+            for be, bn in zip(ema_net.buffers(), net.buffers()):
+                be.copy_(bn)
+        if step % 50 == 0 or step == args.steps:
+            with torch.no_grad():
+                vp = ema_net(val_x)
+                cp = val_x[:, :3] - vp
+                ct = val_x[:, :3] - val_y
+                mse = ((cp - ct) ** 2).mean().item()
+                # save on the combined objective (pixel + edge) so gains in
+                # text/edge crispness are captured, not just flat-area MSE
+                score = mse + args.grad_weight * _grad_loss(cp, ct).item()
+                psnr = -10 * np.log10(mse + 1e-12)
+            print(f"step {step:5d}  loss {loss.item():.4f}  val-PSNR {psnr:.2f} dB  "
+                  f"({(time.time()-t0)/60:.1f} min)", flush=True)
+            if score < best:
+                best = score
+                torch.save(ema_net.state_dict(), args.out)
+    print(f"done; best val PSNR {-10*np.log10(best+1e-12):.2f} dB -> {args.out}")
+
+
+if __name__ == "__main__":
+    main()
