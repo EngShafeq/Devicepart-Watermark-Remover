@@ -1,0 +1,38 @@
+name: E-commerce tests
+
+# Runs the standard-library-only e-commerce backend test suite. It has no
+# third-party runtime dependencies (only pytest for the tests), so it is fast
+# and isolated from the watermark tooling.
+
+on:
+  push:
+    paths:
+      - "ecommerce/**"
+      - "tests/ecommerce/**"
+      - "examples/ecommerce_demo.py"
+      - ".github/workflows/ecommerce-tests.yml"
+  pull_request:
+    paths:
+      - "ecommerce/**"
+      - "tests/ecommerce/**"
+      - "examples/ecommerce_demo.py"
+      - ".github/workflows/ecommerce-tests.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install pytest
+        run: python -m pip install --upgrade pip pytest
+      - name: Run the verification suite
+        run: python -m pytest tests/ecommerce -q
+      - name: Run the end-to-end demo
+        run: python examples/ecommerce_demo.py
